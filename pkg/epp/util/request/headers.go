@@ -32,6 +32,7 @@ var (
 	// We must extract these, then strip them so they don't leak to the backend.
 	InputControlHeaders = lowerHeaderNames(
 		metadata.FlowFairnessIDKey,
+		metadata.FlowFairnessWeightKey,
 		metadata.InferenceTTLHeaderKey,
 		metadata.ObjectiveKey,
 		metadata.ModelNameRewriteKey,
