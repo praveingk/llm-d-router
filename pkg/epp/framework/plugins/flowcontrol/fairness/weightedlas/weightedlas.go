@@ -48,11 +48,6 @@ const (
 	// defaultFlowWeight applies to a flow that never declares one. Its absolute value
 	// is unobservable; only ratios between flows affect scheduling.
 	defaultFlowWeight = 1.0
-
-	// An output token costs about twice an input token. Matches the program-aware LAS
-	// strategy so the two report comparable service figures.
-	weightInputToken  = 1
-	weightOutputToken = 2
 )
 
 // Config is the JSON parameters block for the policy.
@@ -63,6 +58,29 @@ type Config struct {
 	MaxFlowWeight   float64 `json:"maxFlowWeight,omitempty"`
 	IdleTTLSeconds  float64 `json:"idleTtlSeconds,omitempty"`
 	SweepSeconds    float64 `json:"sweepSeconds,omitempty"`
+
+	// The cost function. Attained service is charged per completed request as
+	//
+	//	cost = CostPerRequest + CostPerInputToken*promptTokens + CostPerOutputToken*completionTokens
+	//
+	// and it is this quantity whose share converges on the ratio of the flows' weights. The
+	// coefficients therefore choose WHAT is being shared, which matters more than it sounds:
+	// on a long-context agentic corpus (ISL ~130k, OSL ~1k) input is ~98% of the default cost,
+	// so the default shares PREFILL and generation throughput is almost unrepresented.
+	//
+	//	0 / 1 / 2    default -- roughly "GPU work", output weighted 2x as on program-aware LAS
+	//	0 / 0 / 1    equal output tokens per second
+	//	0 / 1 / 0    equal prefill
+	//	1 / 0 / 0    equal request counts -- the unit the roundrobin policy uses, reached here
+	//	             through decayed service accounting rather than by cycling turns
+	//	50 / 0.5 / 3 a blend: fixed per-request overhead plus token costs
+	//
+	// All three must be >= 0 and not all zero. All-zero would make every cost 0, so nothing is
+	// ever charged, every flow sits at zero service forever, and the policy silently degenerates
+	// into head-wait-only ordering while still looking configured.
+	CostPerRequest     float64 `json:"costPerRequest,omitempty"`
+	CostPerInputToken  float64 `json:"costPerInputToken,omitempty"`
+	CostPerOutputToken float64 `json:"costPerOutputToken,omitempty"`
 }
 
 // DefaultConfig returns the configuration used when no parameters are supplied.
@@ -74,6 +92,10 @@ func DefaultConfig() Config {
 		MaxFlowWeight:   10,
 		IdleTTLSeconds:  3600,
 		SweepSeconds:    300,
+		// 0/1/2 reproduces the previously hardcoded cost function byte for byte.
+		CostPerRequest:     0,
+		CostPerInputToken:  1,
+		CostPerOutputToken: 2,
 	}
 }
 
@@ -91,6 +113,16 @@ func (c Config) validate() error {
 		return fmt.Errorf("idleTtlSeconds must be >= 0, got %v", c.IdleTTLSeconds)
 	case c.SweepSeconds <= 0:
 		return fmt.Errorf("sweepSeconds must be > 0, got %v", c.SweepSeconds)
+	case c.CostPerRequest < 0:
+		return fmt.Errorf("costPerRequest must be >= 0, got %v", c.CostPerRequest)
+	case c.CostPerInputToken < 0:
+		return fmt.Errorf("costPerInputToken must be >= 0, got %v", c.CostPerInputToken)
+	case c.CostPerOutputToken < 0:
+		return fmt.Errorf("costPerOutputToken must be >= 0, got %v", c.CostPerOutputToken)
+	case c.CostPerRequest == 0 && c.CostPerInputToken == 0 && c.CostPerOutputToken == 0:
+		return fmt.Errorf("cost coefficients cannot all be zero: nothing would ever be charged, " +
+			"so every flow would sit at zero attained service and the policy would silently " +
+			"degenerate into head-wait-only ordering")
 	}
 	return nil
 }
@@ -246,8 +278,9 @@ func (p *weightedLAS) ResponseBody(
 	if request == nil || response == nil || !response.EndOfStream {
 		return
 	}
-	cost := float64(weightInputToken*int64(response.Usage.PromptTokens) +
-		weightOutputToken*int64(response.Usage.CompletionTokens))
+	cost := p.cfg.CostPerRequest +
+		p.cfg.CostPerInputToken*float64(response.Usage.PromptTokens) +
+		p.cfg.CostPerOutputToken*float64(response.Usage.CompletionTokens)
 	if cost == 0 {
 		return
 	}

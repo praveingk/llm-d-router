@@ -318,3 +318,81 @@ func TestConfig_Rejects(t *testing.T) {
 		})
 	}
 }
+
+// chargeIO accrues service through the real completion hook with BOTH token counts set,
+// which is what makes the cost coefficients observable.
+func chargeIO(p *weightedLAS, id string, priority, promptTokens, completionTokens int) {
+	req := &fwksched.InferenceRequest{
+		FairnessID: id,
+		Objectives: fwksched.RequestObjectives{Priority: priority},
+	}
+	resp := &fwkrc.Response{EndOfStream: true}
+	resp.Usage.PromptTokens = promptTokens
+	resp.Usage.CompletionTokens = completionTokens
+	p.ResponseBody(context.Background(), req, resp, nil)
+}
+
+// The default cost function must stay 1x input + 2x output, so existing deployments are
+// unaffected by the coefficients becoming configurable.
+func TestCost_DefaultsAreOneInputTwoOutput(t *testing.T) {
+	p := newTestPolicy(t, `{"halfLifeSeconds":0}`)
+
+	chargeIO(p, "alpha", 0, 100, 10)
+
+	assert.InDelta(t, 120.0, testutil.ToFloat64(p.serviceGauge.WithLabelValues("alpha", "0")), 1e-9)
+}
+
+// EQUAL OUTPUT THROUGHPUT. On a long-context agentic corpus, input is ~98% of the default
+// cost, so the default is effectively prefill-fairness and generation throughput is almost
+// unrepresented. Charging output only makes the policy share tok/s instead.
+func TestCost_OutputOnlySharesGenerationThroughput(t *testing.T) {
+	p := newTestPolicy(t, `{"halfLifeSeconds":0,"costPerInputToken":0,"costPerOutputToken":1}`)
+
+	chargeIO(p, "alpha", 0, 100000, 250)
+
+	assert.InDelta(t, 250.0, testutil.ToFloat64(p.serviceGauge.WithLabelValues("alpha", "0")), 1e-9,
+		"a 100k-token prompt must cost nothing when only output is charged")
+}
+
+// EQUAL TURNS. A flat per-request cost with both token coefficients at zero makes attained
+// service count requests, so equalizing service/weight equalizes request counts -- the unit the
+// roundrobin policy uses, reached here through service accounting rather than by cycling turns.
+func TestCost_PerRequestOnlyCountsTurns(t *testing.T) {
+	p := newTestPolicy(t, `{"halfLifeSeconds":0,"costPerRequest":1,"costPerInputToken":0,"costPerOutputToken":0}`)
+
+	chargeIO(p, "alpha", 0, 100000, 5000)
+	chargeIO(p, "alpha", 0, 7, 1)
+
+	assert.InDelta(t, 2.0, testutil.ToFloat64(p.serviceGauge.WithLabelValues("alpha", "0")), 1e-9,
+		"two requests of wildly different size must cost 2 when only requests are charged")
+}
+
+// A blend is the point of having three coefficients: a fixed per-request overhead plus token
+// costs is closer to real GPU cost than either extreme.
+func TestCost_BlendsAllThreeCoefficients(t *testing.T) {
+	p := newTestPolicy(t, `{"halfLifeSeconds":0,"costPerRequest":50,"costPerInputToken":0.5,"costPerOutputToken":3}`)
+
+	chargeIO(p, "alpha", 0, 200, 10)
+
+	// 50 + 0.5*200 + 3*10 = 180
+	assert.InDelta(t, 180.0, testutil.ToFloat64(p.serviceGauge.WithLabelValues("alpha", "0")), 1e-9)
+}
+
+// All-zero coefficients would make every cost 0, so nothing is ever charged, every flow sits
+// at zero service forever and the policy silently degenerates into head-wait ordering. That
+// must be a startup error rather than a plausible-looking null result.
+func TestConfig_RejectsAllZeroCostCoefficients(t *testing.T) {
+	_, err := WeightedLASFairnessPolicyFactory("x",
+		json.NewDecoder(bytes.NewReader([]byte(`{"costPerRequest":0,"costPerInputToken":0,"costPerOutputToken":0}`))), nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cost")
+}
+
+func TestConfig_RejectsNegativeCostCoefficient(t *testing.T) {
+	_, err := WeightedLASFairnessPolicyFactory("x",
+		json.NewDecoder(bytes.NewReader([]byte(`{"costPerOutputToken":-1}`))), nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "costPerOutputToken")
+}
