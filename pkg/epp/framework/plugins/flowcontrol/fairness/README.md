@@ -20,7 +20,7 @@ Fairness policies must often maintain state (e.g., Round Robin cursors) for each
 
 *   **[Round Robin](./roundrobin/README.md)** (`round-robin-fairness-policy`): Cycles through active flows one by one to guarantee no single flow can starve others.
 *   **[Global Strict](./globalstrict/README.md)** (`global-strict-fairness-policy`): A greedy strategy that ignores flow boundaries and picks the absolute "best" request globally.
-*   **[Weighted LAS](./weightedlas/README.md)** (`weighted-las-fairness-policy`): Least-attained-service scheduling in which each flow's attained service is divided by a share weight declared in the `x-llm-d-inference-fairness-weight` header, so service shares converge on the ratio of those weights. The unit of service is a configurable cost function over prompt and completion tokens, so it can share total work, generation throughput, or request counts.
+*   **[Weighted LAS](./weightedlas/README.md)** (`weighted-las-fairness-policy`): Least-attained-service scheduling in which each flow's attained service is divided by a share weight declared per fairness ID in the policy's own configuration, so service shares converge on the ratio of those weights. The unit of service is a configurable cost function over prompt and completion tokens, so it can share total work, generation throughput, or request counts.
 
 ## Conformance Testing
 

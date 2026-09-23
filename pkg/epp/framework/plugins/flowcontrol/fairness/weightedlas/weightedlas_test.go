@@ -34,7 +34,6 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
 // newTestPolicy builds a policy from a JSON parameters blob, exercising the real
@@ -53,13 +52,17 @@ func newTestPolicy(t *testing.T, params string) *weightedLAS {
 	return policy
 }
 
-// queueWithWeight builds a single-item queue whose head request declares the given
-// weight header. A weight of "" omits the header entirely.
-func queueWithWeight(id string, priority int, weight string, headEnqueue time.Time) *fwkfcmocks.MockFlowQueueAccessor {
-	headers := map[string]string{}
-	if weight != "" {
-		headers[metadata.FlowFairnessWeightKey] = weight
-	}
+// queuedFlow builds a single-item queue for a flow. It takes no weight: weights are
+// operator configuration now, so nothing a request carries can affect its share.
+func queuedFlow(id string, priority int, headEnqueue time.Time) *fwkfcmocks.MockFlowQueueAccessor {
+	return queuedFlowWithHeaders(id, priority, headEnqueue, map[string]string{})
+}
+
+// queuedFlowWithHeaders is the same but lets a test put arbitrary headers on the head
+// request, to assert that they are ignored.
+func queuedFlowWithHeaders(
+	id string, priority int, headEnqueue time.Time, headers map[string]string,
+) *fwkfcmocks.MockFlowQueueAccessor {
 	return &fwkfcmocks.MockFlowQueueAccessor{
 		LenV:     1,
 		FlowKeyV: flowcontrol.FlowKey{ID: id, Priority: priority},
@@ -103,19 +106,20 @@ func charge(p *weightedLAS, id string, priority int, promptTokens int) {
 	p.ResponseBody(context.Background(), req, resp, nil)
 }
 
-// A flow declaring weight 3 that has consumed 300 tokens is at 100 tokens per unit
+// A flow CONFIGURED at weight 3 that has consumed 300 tokens is at 100 tokens per unit
 // of weight, so it outranks a weight-1 flow sitting at 150 -- even though its raw
 // attained service is twice as high. Unweighted LAS picks beta here.
 func TestPick_WeightScalesService(t *testing.T) {
-	p := newTestPolicy(t, `{"weightService":1.0,"weightHeadWait":0.0,"halfLifeSeconds":0}`)
+	p := newTestPolicy(t, `{"weightService":1.0,"weightHeadWait":0.0,"halfLifeSeconds":0,
+		"flowWeights":{"alpha":3,"beta":1}}`)
 	now := time.Now()
 
 	charge(p, "alpha", 0, 300)
 	charge(p, "beta", 0, 150)
 
 	band := bandOf(0,
-		queueWithWeight("alpha", 0, "3", now),
-		queueWithWeight("beta", 0, "1", now),
+		queuedFlow("alpha", 0, now),
+		queuedFlow("beta", 0, now),
 	)
 
 	got, err := p.Pick(context.Background(), band)
@@ -192,8 +196,8 @@ func TestPick_PerBandIsolation(t *testing.T) {
 	charge(p, "other", 10, 100) // light use in the band under test
 
 	band := bandOf(10,
-		queueWithWeight("tenant", 10, "1", now),
-		queueWithWeight("other", 10, "1", now),
+		queuedFlow("tenant", 10, now),
+		queuedFlow("other", 10, now),
 	)
 
 	got, err := p.Pick(context.Background(), band)
@@ -206,55 +210,19 @@ func TestPick_PerBandIsolation(t *testing.T) {
 		"service charged at priority 0 must not appear at priority 10")
 }
 
-func TestDeclaredWeight(t *testing.T) {
-	p := newTestPolicy(t, `{"maxFlowWeight":10}`)
-
-	cases := []struct {
-		name   string
-		header string
-		want   float64
-	}{
-		{"absent", "", 0},
-		{"whitespace only", "   ", 0},
-		{"not a number", "abc", 0},
-		{"zero is not a share", "0", 0},
-		{"negative", "-1", 0},
-		{"integer", "3", 3},
-		{"fractional", "3.5", 3.5},
-		{"surrounding whitespace", "  3  ", 3},
-		{"above the ceiling is clamped", "1e9", 10},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			q := queueWithWeight("f", 0, tc.header, time.Now())
-			assert.InDelta(t, tc.want, p.declaredWeight(q.Peek()), 1e-9)
-		})
-	}
-}
-
-// A flow's weight is carried on its requests, but not every request need repeat it.
-// The last valid declaration stands so the share does not flap to 1.0 whenever a
-// request arrives without the header.
-func TestWeight_StickyAcrossRequests(t *testing.T) {
-	p := newTestPolicy(t, `{"halfLifeSeconds":0}`)
-	st := p.stateFor(flowcontrol.FlowKey{ID: "alpha", Priority: 0})
-
-	assert.InDelta(t, 1.0, st.observeWeight(0), 1e-9, "a flow that never declared a weight sits at the default")
-	assert.InDelta(t, 4.0, st.observeWeight(4), 1e-9)
-	assert.InDelta(t, 4.0, st.observeWeight(0), 1e-9, "an undeclared request must not reset the weight")
-}
-
 // The actual claim of the feature: over many dispatches, service shares converge on
 // the ratio of the configured weights.
 func TestPick_ConvergesToWeightRatio(t *testing.T) {
-	p := newTestPolicy(t, `{"weightService":1.0,"weightHeadWait":0.0,"halfLifeSeconds":0}`)
+	// Weights are declared by the operator, not by the requests. The empty header argument
+	// below is deliberate: it shows the ratio comes from config alone.
+	p := newTestPolicy(t, `{"weightService":1.0,"weightHeadWait":0.0,"halfLifeSeconds":0,
+		"flowWeights":{"big":4,"mid":2,"small":1}}`)
 	now := time.Now()
 
-	weights := map[string]string{"big": "4", "mid": "2", "small": "1"}
 	band := bandOf(0,
-		queueWithWeight("big", 0, weights["big"], now),
-		queueWithWeight("mid", 0, weights["mid"], now),
-		queueWithWeight("small", 0, weights["small"], now),
+		queuedFlow("big", 0, now),
+		queuedFlow("mid", 0, now),
+		queuedFlow("small", 0, now),
 	)
 
 	const iterations = 3000
@@ -308,7 +276,6 @@ func TestConfig_Rejects(t *testing.T) {
 	cases := map[string]string{
 		"negative service weight": `{"weightService":-1}`,
 		"negative half life":      `{"halfLifeSeconds":-1}`,
-		"max weight below one":    `{"maxFlowWeight":0.5}`,
 		"zero sweep interval":     `{"sweepSeconds":0}`,
 	}
 	for name, params := range cases {
@@ -395,4 +362,77 @@ func TestConfig_RejectsNegativeCostCoefficient(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "costPerOutputToken")
+}
+
+func TestConfig_FlowWeightsFromOperatorConfig(t *testing.T) {
+	t.Parallel()
+	p := newTestPolicy(t, `{"flowWeights":{"team-a":7,"team-b":3},"defaultFlowWeight":1}`)
+
+	assert.Equal(t, 7.0, p.cfg.FlowWeights["team-a"])
+	assert.Equal(t, 3.0, p.cfg.FlowWeights["team-b"])
+	assert.Equal(t, 1.0, p.cfg.DefaultFlowWeight)
+}
+
+// An unset defaultFlowWeight must be 1, not 0: a zero default would divide by zero for
+// every unlisted tenant.
+func TestConfig_DefaultFlowWeightDefaultsToOne(t *testing.T) {
+	t.Parallel()
+	p := newTestPolicy(t, `{"flowWeights":{"team-a":7}}`)
+
+	assert.Equal(t, 1.0, p.cfg.DefaultFlowWeight)
+}
+
+// Weights are operator input now, so a bad value is a deployment error and must be loud at
+// startup rather than clamped into something plausible.
+func TestConfig_RejectsNonPositiveDeclaredWeight(t *testing.T) {
+	t.Parallel()
+	for _, blob := range []string{
+		`{"flowWeights":{"team-a":0}}`,
+		`{"flowWeights":{"team-a":-3}}`,
+		`{"defaultFlowWeight":0}`,
+	} {
+		_, err := WeightedLASFairnessPolicyFactory("x",
+			json.NewDecoder(bytes.NewReader([]byte(blob))), nil)
+		require.Error(t, err, "blob %s should be rejected", blob)
+		assert.Contains(t, err.Error(), "weight")
+	}
+}
+
+func TestWeightFor_ResolvesFromConfigNotHeader(t *testing.T) {
+	t.Parallel()
+	p := newTestPolicy(t, `{"flowWeights":{"team-a":7,"team-b":3},"defaultFlowWeight":2}`)
+
+	assert.Equal(t, 7.0, p.weightFor(flowcontrol.FlowKey{ID: "team-a", Priority: 0}))
+	assert.Equal(t, 3.0, p.weightFor(flowcontrol.FlowKey{ID: "team-b", Priority: 0}))
+	assert.Equal(t, 2.0, p.weightFor(flowcontrol.FlowKey{ID: "unlisted", Priority: 0}),
+		"an unlisted tenant takes the default")
+}
+
+// Weight is a property of the tenant, not of the band, so the same ID at two priorities
+// resolves to the same weight even though the two remain separate flows for accounting.
+func TestWeightFor_KeysOnIDNotPriority(t *testing.T) {
+	t.Parallel()
+	p := newTestPolicy(t, `{"flowWeights":{"team-a":7}}`)
+
+	assert.Equal(t, 7.0, p.weightFor(flowcontrol.FlowKey{ID: "team-a", Priority: 0}))
+	assert.Equal(t, 7.0, p.weightFor(flowcontrol.FlowKey{ID: "team-a", Priority: -10}))
+}
+
+// A caller cannot influence its own share. The router defines no weight header at all now, so
+// this sends a raw, unrecognised one -- the shape a client would forge -- and asserts the
+// policy still uses the configured weight. This is the North Star non-goal: a weight sets the
+// relative price of capacity, and a request may not name its own price.
+func TestWeightFor_IgnoresAnyWeightLikeHeader(t *testing.T) {
+	t.Parallel()
+	p := newTestPolicy(t, `{"flowWeights":{"team-a":7}}`)
+	band := bandOf(0, queuedFlowWithHeaders("team-a", 0, time.Now(), map[string]string{
+		"x-llm-d-inference-fairness-weight": "999",
+	}))
+
+	got, err := p.Pick(context.Background(), band)
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, 7.0, testutil.ToFloat64(p.weightGauge.WithLabelValues("team-a", "0")),
+		"the gauge must report the CONFIGURED weight, never the header's 999")
 }

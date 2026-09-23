@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,9 +54,26 @@ type Config struct {
 	WeightService   float64 `json:"weightService,omitempty"`
 	WeightHeadWait  float64 `json:"weightHeadWait,omitempty"`
 	HalfLifeSeconds float64 `json:"halfLifeSeconds,omitempty"`
-	MaxFlowWeight   float64 `json:"maxFlowWeight,omitempty"`
 	IdleTTLSeconds  float64 `json:"idleTtlSeconds,omitempty"`
 	SweepSeconds    float64 `json:"sweepSeconds,omitempty"`
+
+	// FlowWeights is the operator's weight table, keyed by fairness ID. The North Star
+	// refuses numeric weights on the wire -- "a weight sets the relative price of capacity,
+	// and a request may not name its own price" -- so entitlement is declared here and a
+	// request carries only the identity it is resolved against.
+	//
+	// This map is the interim carrier until the entitlement object ships. Nothing outside
+	// weightFor depends on where a weight came from, so that swap stays local.
+	//
+	// There is deliberately no ceiling on a declared weight. The old maxFlowWeight existed
+	// only to cap a client-supplied value; operator config wants a loud startup error on a
+	// typo, not a silent clamp that hides it.
+	FlowWeights map[string]float64 `json:"flowWeights,omitempty"`
+
+	// DefaultFlowWeight applies to any fairness ID absent from FlowWeights, including the
+	// default tenant that unstamped callers fall into. Only ratios between flows affect
+	// scheduling, so its absolute value is unobservable.
+	DefaultFlowWeight float64 `json:"defaultFlowWeight,omitempty"`
 
 	// The cost function. Attained service is charged per completed request as
 	//
@@ -89,9 +105,10 @@ func DefaultConfig() Config {
 		WeightService:   0.8,
 		WeightHeadWait:  0.2,
 		HalfLifeSeconds: 60,
-		MaxFlowWeight:   10,
 		IdleTTLSeconds:  3600,
 		SweepSeconds:    300,
+		// Unlisted tenants share equally. Must not be 0: weightFor divides by it.
+		DefaultFlowWeight: 1,
 		// 0/1/2 reproduces the previously hardcoded cost function byte for byte.
 		CostPerRequest:     0,
 		CostPerInputToken:  1,
@@ -107,8 +124,6 @@ func (c Config) validate() error {
 		return fmt.Errorf("weightHeadWait must be >= 0, got %v", c.WeightHeadWait)
 	case c.HalfLifeSeconds < 0:
 		return fmt.Errorf("halfLifeSeconds must be >= 0, got %v", c.HalfLifeSeconds)
-	case c.MaxFlowWeight < 1:
-		return fmt.Errorf("maxFlowWeight must be >= 1, got %v", c.MaxFlowWeight)
 	case c.IdleTTLSeconds < 0:
 		return fmt.Errorf("idleTtlSeconds must be >= 0, got %v", c.IdleTTLSeconds)
 	case c.SweepSeconds <= 0:
@@ -123,6 +138,15 @@ func (c Config) validate() error {
 		return fmt.Errorf("cost coefficients cannot all be zero: nothing would ever be charged, " +
 			"so every flow would sit at zero attained service and the policy would silently " +
 			"degenerate into head-wait-only ordering")
+	case c.DefaultFlowWeight <= 0:
+		return fmt.Errorf("defaultFlowWeight must be > 0, got %v", c.DefaultFlowWeight)
+	}
+	// Declared weights are operator input, so a bad one is a deployment error: fail loudly at
+	// startup rather than clamping it into something that looks deliberate.
+	for id, w := range c.FlowWeights {
+		if w <= 0 {
+			return fmt.Errorf("flowWeights[%q]: weight must be > 0, got %v", id, w)
+		}
 	}
 	return nil
 }
@@ -235,7 +259,7 @@ func (p *weightedLAS) Pick(
 
 		key := queue.FlowKey()
 		st := p.stateFor(key)
-		flowWeight := st.observeWeight(p.declaredWeight(head))
+		flowWeight := p.weightFor(key)
 		p.weightGauge.WithLabelValues(key.ID, strconv.Itoa(key.Priority)).Set(flowWeight)
 
 		// The one difference from plain LAS: score on service per unit of share weight.
@@ -297,7 +321,6 @@ type flowState struct {
 	mu              sync.Mutex
 	attainedService float64
 	serviceAsOf     time.Time
-	weight          float64 // last valid declared weight, 0 if never declared
 }
 
 // addService folds in the decay owed since serviceAsOf, charges cost, and returns the
@@ -326,20 +349,6 @@ func (s *flowState) service(now time.Time, halfLife float64) float64 {
 	return s.addService(0, now, halfLife)
 }
 
-// observeWeight returns the weight in force. A declared 0 means nothing valid was on
-// this request, so the flow's last valid weight stands.
-func (s *flowState) observeWeight(declared float64) float64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if declared > 0 {
-		s.weight = declared
-	}
-	if s.weight <= 0 {
-		return defaultFlowWeight
-	}
-	return s.weight
-}
-
 func (s *flowState) lastTouch() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -360,28 +369,24 @@ func (p *weightedLAS) stateFor(key flowcontrol.FlowKey) *flowState {
 	return st
 }
 
-// declaredWeight reads the share weight off the head request. It returns 0 when the
-// header is absent, unparseable or not strictly positive, which the caller reads as "no
-// declaration". Values are clamped to maxFlowWeight because the header is
-// client-supplied.
-func (p *weightedLAS) declaredWeight(item flowcontrol.QueueItemAccessor) float64 {
-	req := item.OriginalRequest()
-	if req == nil {
-		return 0
+// maybePrune runs an idle sweep at most once per sweepSeconds.
+// weightFor resolves a flow's weight from the operator's table, falling back to
+// DefaultFlowWeight for any ID the table does not name -- including the default tenant that
+// unstamped callers fall into.
+//
+// Keyed on ID alone: weight is a property of the tenant, while FlowKey is composite so that
+// the same tenant at two priorities keeps separate service accounting.
+//
+// There is deliberately no per-flow weight memory and no header read. The router defines no
+// weight header at all, so nothing a caller sends can change its share -- which is the point:
+// a request may not name its own price.
+func (p *weightedLAS) weightFor(key flowcontrol.FlowKey) float64 {
+	if w, ok := p.cfg.FlowWeights[key.ID]; ok && w > 0 {
+		return w
 	}
-	infReq := req.InferenceRequest()
-	if infReq == nil || infReq.Headers == nil {
-		return 0
-	}
-	raw, _ := metadata.GetLowerCaseHeaderValue(infReq.Headers, metadata.FlowFairnessWeightKey)
-	w, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil || math.IsNaN(w) || w <= 0 {
-		return 0
-	}
-	return math.Min(w, p.cfg.MaxFlowWeight)
+	return p.cfg.DefaultFlowWeight
 }
 
-// maybePrune runs an idle sweep at most once per sweepSeconds.
 func (p *weightedLAS) maybePrune(now time.Time) {
 	if p.cfg.IdleTTLSeconds <= 0 {
 		return

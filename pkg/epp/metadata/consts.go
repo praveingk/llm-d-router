@@ -41,9 +41,6 @@ const (
 	InferenceTTLHeaderKey = "x-llm-d-inference-ttl"
 	// OldFlowFairnessIDKey is the deprecated alias for FlowFairnessIDKey.
 	OldFlowFairnessIDKey = "x-gateway-inference-fairness-id"
-	// FlowFairnessWeightKey is the header key used to pass the relative share weight for a
-	// fairness flow. It is consumed by the weighted-las fairness policy.
-	FlowFairnessWeightKey = "x-llm-d-inference-fairness-weight"
 	// ObjectiveKey is the header key used to specify the objective of an incoming request.
 	ObjectiveKey = "x-llm-d-inference-objective"
 	// OldObjectiveKey is the deprecated alias for ObjectiveKey.

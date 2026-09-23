@@ -2,7 +2,7 @@
 
 **Type:** `weighted-las-fairness-policy`
 
-The Weighted LAS policy serves the flow with the least attained service **per unit of share weight**. Each flow accrues service as its requests complete; dividing that service by a weight declared per request drives the flows' service shares toward the ratio of their weights. At equal weights it is plain least-attained-service, which shares the pool evenly by work done rather than by turn.
+The Weighted LAS policy serves the flow with the least attained service **per unit of share weight**. Each flow accrues service as its requests complete; dividing that service by a weight the operator declares for that tenant drives the flows' service shares toward the ratio of their weights. At equal weights it is plain least-attained-service, which shares the pool evenly by work done rather than by turn.
 
 Registered at **Alpha** stability, so the EPP requires `--allow-experimental-plugins`. Without it the EPP refuses to start — a clean refusal, not a silent fallback to another fairness policy.
 
@@ -17,7 +17,7 @@ The unit is also configurable, so "work" can mean prompt processing, generation,
 1.  **Scoring**: For each active flow it computes `attainedService / flowWeight`, range-normalizes across the candidates, inverts it (less service per unit of weight scores higher), and blends in the head item's queue wait as an anti-starvation term.
 2.  **Charging**: A flow is charged when one of its requests completes (`ResponseBody`, at end of stream), using the configured cost function over the server-reported prompt and completion token counts.
 3.  **Decay**: Attained service decays exponentially, so a flow that goes quiet recovers priority. Decay is applied lazily on read or write, so an idle flow ages out without being visited.
-4.  **Weight resolution**: The weight is read from the head request's `x-llm-d-inference-fairness-weight` header, clamped to `maxFlowWeight`, and remembered per flow so a tenant need not stamp every request.
+4.  **Weight resolution**: The weight is looked up in the `flowWeights` table by the flow's fairness ID, falling back to `defaultFlowWeight` for any ID the table does not name. Requests carry no weight at all.
 5.  **Pruning**: Flows idle beyond `idleTtlSeconds` are swept out, at most once per `sweepSeconds`, on the `Pick` path — the policy owns no goroutine.
 
 ## Unit of Fairness
@@ -31,12 +31,18 @@ cost = costPerRequest + costPerInputToken × promptTokens + costPerOutputToken �
 The default `0 / 1 / 2` weights an output token at twice an input token.
 However, the cost can be used to effect different notions of fairness, because it selects *which* resource the weights divide. Set `0 / 0 / 1` and cost becomes completion tokens alone, so weights 7:3 divide **output tokens per second** 70:30 and prompt processing is free. Set `1 / 0 / 0` and cost becomes a flat charge per request, so the same weights divide **turns** 70:30 however expensive each turn is. So pick the coefficients from the SLO you are dividing, not by tuning — see [Choosing the cost coefficients](#choosing-the-cost-coefficients).
 
+**Weights come from operator configuration, never from the request.** The North Star refuses
+numeric weights on the wire — a weight sets the relative price of capacity, and a request may not
+name its own price — so a request carries only the identity its weight is resolved against. There is
+no weight header: the router does not define one, and a caller cannot influence its own share.
+
 **A flow's weight is keyed by `FlowKey`, which is composite.** One tenant sending at two priorities is two flows with separate service — bands dispatch in strict order, and pooling them would let work done in one band deprioritize the tenant in another.
 
 ## Inputs consumed
 
 *   **Queue state**: Iterates active queues on the `PriorityBandAccessor`, reading each head item and its enqueue time.
-*   **Request headers**: `x-llm-d-inference-fairness-weight` off the head request; `x-llm-d-inference-fairness-id` supplies the flow id, falling back to a single default id when absent.
+*   **Request headers**: `x-llm-d-inference-fairness-id` only, which supplies the flow id and falls back to a single default id when absent. No weight is read from the request.
+*   **Policy configuration**: the `flowWeights` table and `defaultFlowWeight`, which together resolve every flow's weight.
 *   **Response usage**: `PromptTokens` and `CompletionTokens` from the final response chunk.
 
 ## Configuration
@@ -45,6 +51,10 @@ However, the cost can be used to effect different notions of fairness, because i
 - type: weighted-las-fairness-policy
   name: weighted-las-fairness-policy
   parameters:
+    flowWeights:              # entitlement is declared here, not by the caller
+      team-a: 7
+      team-b: 3
+    defaultFlowWeight: 1      # anything not named above
     costPerInputToken: 0      # share generation throughput instead of total work
     costPerOutputToken: 1
 ```
@@ -54,7 +64,8 @@ However, the cost can be used to effect different notions of fairness, because i
 | `weightService` | `0.8` | Weight of the normalized service term in the score. |
 | `weightHeadWait` | `0.2` | Weight of the head-of-queue wait term. Anti-starvation; it is **not** scaled by the flow weight. |
 | `halfLifeSeconds` | `60` | Exponential decay half-life for attained service. `0` disables decay. |
-| `maxFlowWeight` | `10` | Ceiling on a declared weight. The header is client-supplied, so without a cap one tenant could monopolize the band. |
+| `flowWeights` | `{}` | Weight per fairness ID. Operator-declared, because a request may not name its own price. There is deliberately no ceiling: a bad value is a deployment error and is rejected at startup rather than silently clamped. |
+| `defaultFlowWeight` | `1` | Weight for any fairness ID absent from `flowWeights`, including the default tenant unstamped callers fall into. |
 | `idleTtlSeconds` | `3600` | Idle flows are pruned after this. |
 | `sweepSeconds` | `300` | Minimum interval between idle sweeps. |
 | `costPerRequest` | `0` | Flat cost charged per completed request. |
@@ -86,7 +97,7 @@ Measured with `0 / 0 / 1` at weights 7:3, on two tenants with identical prompt a
 | `llm_d_epp_weighted_las_attained_service_tokens` | gauge | `flow_id`, `priority`, `policy` |
 | `llm_d_epp_weighted_las_flow_weight` | gauge | `flow_id`, `priority`, `policy` |
 
-The weight gauge is the only way to confirm the EPP actually **read** a declared weight rather than falling back to the default — without it, a misdelivered header is indistinguishable from a policy that ignores weights. Collectors are per-instance and registered through `handle.Metrics()`, so two instances can share one registry.
+The weight gauge is the only way to confirm the EPP **resolved** the weight you configured rather than falling back to `defaultFlowWeight` — a fairness ID that does not match the table is otherwise indistinguishable from a policy that ignores weights, and a typo in either place looks identical from outside. Collectors are per-instance and registered through `handle.Metrics()`, so two instances can share one registry.
 
 Note the service gauge is the *decayed* value, so it reflects recent service rather than a run total, and comparing it across two different `halfLifeSeconds` settings compares two different instruments.
 
@@ -94,9 +105,6 @@ Note the service gauge is the *decayed* value, so it reflects recent service rat
 
 *   **It does not fully enforce its target.** Measured at 7:3 on a contended pool, achieved service ratios landed 13–20% short of the ideal, consistently under-correcting toward parity. Four causes have been ruled out — workload heterogeneity, the head-wait term (with only two flows it cannot flip a decision), starvation, and decay/lag as a *major* factor. The residual is open. Treat the weights as a strong bias, not a hard guarantee.
 *   **The control loop is delayed.** Service is charged at completion, which on long requests is tens of seconds after the dispatch decision it should have informed. [Round Robin](../roundrobin/README.md) knows a turn's cost at selection time and has no such lag.
-*   **Weights are sticky per flow.** A flow's last valid declared weight stands for requests that omit the header. Convenient, but an A/B comparison **must** restart the EPP (or use fresh flow ids) between arms, or the unweighted arm silently inherits the previous arm's weights and reports a weighted split while appearing to send none.
-
-## Related Documentation
 *   [Fairness Overview](../README.md)
 *   [Round Robin](../roundrobin/README.md) — the same idea with turns as the unit
 *   [Program-Aware](../program-aware/README.md) — its `las` strategy shares this service definition
