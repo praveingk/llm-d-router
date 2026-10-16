@@ -50,6 +50,14 @@ type Config struct {
 
 	TurnPriorityTimeWeight        float64 `json:"turnPriorityTimeWeight,omitempty"`
 	TurnPriorityInactivitySeconds float64 `json:"turnPriorityInactivitySeconds,omitempty"`
+
+	GroupTurnSize            int     `json:"groupTurnSize,omitempty"`
+	GroupTurnQuota           int64   `json:"groupTurnQuota,omitempty"`
+	GroupTurnEntryPolicy     string  `json:"groupTurnEntryPolicy,omitempty"`
+	GroupTurnVictimPolicy    string  `json:"groupTurnVictimPolicy,omitempty"`
+	GroupTurnCreditPolicy    string  `json:"groupTurnCreditPolicy,omitempty"`
+	GroupTurnHoldSeconds     float64 `json:"groupTurnHoldSeconds,omitempty"`
+	GroupTurnHalfLifeSeconds float64 `json:"groupTurnHalfLifeSeconds,omitempty"`
 }
 
 func DefaultConfig() Config {
@@ -63,6 +71,14 @@ func DefaultConfig() Config {
 
 		TurnPriorityTimeWeight:        0.05,
 		TurnPriorityInactivitySeconds: 120,
+
+		GroupTurnSize:            32,
+		GroupTurnQuota:           4,
+		GroupTurnEntryPolicy:     groupTurnEntryLeastService,
+		GroupTurnVictimPolicy:    groupTurnVictimLongestIdle,
+		GroupTurnCreditPolicy:    groupTurnCreditKeep,
+		GroupTurnHoldSeconds:     120,
+		GroupTurnHalfLifeSeconds: 60,
 	}
 }
 
@@ -87,6 +103,33 @@ func (c Config) validate() error {
 	}
 	if c.TurnPriorityInactivitySeconds < 0 {
 		return fmt.Errorf("turnPriorityInactivitySeconds must be >= 0, got %v", c.TurnPriorityInactivitySeconds)
+	}
+	if c.GroupTurnSize < 1 {
+		return fmt.Errorf("groupTurnSize must be >= 1, got %v", c.GroupTurnSize)
+	}
+	if c.GroupTurnQuota < 1 {
+		return fmt.Errorf("groupTurnQuota must be >= 1, got %v", c.GroupTurnQuota)
+	}
+	switch c.GroupTurnEntryPolicy {
+	case groupTurnEntryLeastService, groupTurnEntryOldestWait:
+	default:
+		return fmt.Errorf("groupTurnEntryPolicy must be %q or %q, got %q", groupTurnEntryLeastService, groupTurnEntryOldestWait, c.GroupTurnEntryPolicy)
+	}
+	switch c.GroupTurnVictimPolicy {
+	case groupTurnVictimLongestIdle, groupTurnVictimLeastService:
+	default:
+		return fmt.Errorf("groupTurnVictimPolicy must be %q or %q, got %q", groupTurnVictimLongestIdle, groupTurnVictimLeastService, c.GroupTurnVictimPolicy)
+	}
+	switch c.GroupTurnCreditPolicy {
+	case groupTurnCreditKeep, groupTurnCreditReset:
+	default:
+		return fmt.Errorf("groupTurnCreditPolicy must be %q or %q, got %q", groupTurnCreditKeep, groupTurnCreditReset, c.GroupTurnCreditPolicy)
+	}
+	if c.GroupTurnHoldSeconds < 0 {
+		return fmt.Errorf("groupTurnHoldSeconds must be >= 0, got %v", c.GroupTurnHoldSeconds)
+	}
+	if c.GroupTurnHalfLifeSeconds < 0 {
+		return fmt.Errorf("groupTurnHalfLifeSeconds must be >= 0, got %v", c.GroupTurnHalfLifeSeconds)
 	}
 	return nil
 }

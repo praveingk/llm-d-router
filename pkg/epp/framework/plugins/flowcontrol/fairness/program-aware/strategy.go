@@ -18,6 +18,7 @@ package programaware
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -56,8 +57,18 @@ func newStrategy(cfg Config) (Strategy, error) {
 			timeWeight:        cfg.TurnPriorityTimeWeight,
 			inactivitySeconds: cfg.TurnPriorityInactivitySeconds,
 		}, nil
+	case groupTurnStrategyName:
+		return &groupTurnStrategy{
+			groupSize:       cfg.GroupTurnSize,
+			turnQuota:       cfg.GroupTurnQuota,
+			entryPolicy:     cfg.GroupTurnEntryPolicy,
+			victimPolicy:    cfg.GroupTurnVictimPolicy,
+			creditPolicy:    cfg.GroupTurnCreditPolicy,
+			holdDuration:    time.Duration(cfg.GroupTurnHoldSeconds * float64(time.Second)),
+			halfLifeSeconds: cfg.GroupTurnHalfLifeSeconds,
+		}, nil
 	default:
-		return nil, fmt.Errorf("unknown scoring strategy %q: only \"las\" and \"turn-priority\" are supported", cfg.Strategy)
+		return nil, fmt.Errorf("unknown scoring strategy %q: only \"las\", \"turn-priority\" and \"group-turn\" are supported", cfg.Strategy)
 	}
 }
 
