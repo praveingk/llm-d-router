@@ -390,3 +390,77 @@ func TestGroupTurn_ConfigValidation(t *testing.T) {
 	cfg.GroupTurnCreditPolicy = "bogus"
 	assert.Error(t, cfg.validate())
 }
+
+func TestGroupTurn_WarmthEDF_SavesExpiringWarmMember(t *testing.T) {
+	s := newGroupTurn(4, 100)
+	s.urgencySeconds = 60 * time.Second
+	now := time.Now()
+
+	idA, qA := makeInfo("alpha", now.Add(-2*time.Second))
+	idB, qB := makeInfo("beta", now.Add(-1*time.Second))
+	queues := map[string]QueueInfo{idA: qA, idB: qB}
+	require.NotNil(t, s.Pick(0, queues)) // both admitted
+
+	// alpha dispatched 50s ago: warm, expiring in 10s.
+	// beta dispatched 5 minutes ago: cold (loss sunk).
+	gtDispatch(s, "alpha")
+	stA := s.getOrCreateState("alpha")
+	stA.mu.Lock()
+	stA.lastDispatch = now.Add(-50 * time.Second)
+	stA.mu.Unlock()
+	stB := s.getOrCreateState("beta")
+	stB.mu.Lock()
+	stB.lastDispatch = now.Add(-5 * time.Minute)
+	stB.mu.Unlock()
+
+	got := s.Pick(0, queues)
+	require.NotNil(t, got)
+	assert.Equal(t, "alpha", got.FlowKey().ID, "warm member closest to expiry is saved before the cold one (plain LRS would pick beta)")
+}
+
+func TestGroupTurn_WarmthEDF_AllColdFallsBackToLRS(t *testing.T) {
+	s := newGroupTurn(4, 100)
+	s.urgencySeconds = 60 * time.Second
+	now := time.Now()
+
+	idA, qA := makeInfo("alpha", now.Add(-2*time.Second))
+	idB, qB := makeInfo("beta", now.Add(-1*time.Second))
+	queues := map[string]QueueInfo{idA: qA, idB: qB}
+	require.NotNil(t, s.Pick(0, queues))
+
+	// Both cold: LRS order applies (oldest lastDispatch first).
+	stA := s.getOrCreateState("alpha")
+	stA.mu.Lock()
+	stA.lastDispatch = now.Add(-5 * time.Minute)
+	stA.mu.Unlock()
+	stB := s.getOrCreateState("beta")
+	stB.mu.Lock()
+	stB.lastDispatch = now.Add(-2 * time.Minute)
+	stB.mu.Unlock()
+
+	got := s.Pick(0, queues)
+	require.NotNil(t, got)
+	assert.Equal(t, "alpha", got.FlowKey().ID, "all cold: least recently served (5 min) goes first")
+}
+
+func TestGroupTurn_WarmthEDF_NeverDispatchedIsCold(t *testing.T) {
+	s := newGroupTurn(4, 100)
+	s.urgencySeconds = 60 * time.Second
+	now := time.Now()
+
+	idA, qA := makeInfo("alpha", now.Add(-2*time.Second))
+	idB, qB := makeInfo("beta", now.Add(-1*time.Second))
+	queues := map[string]QueueInfo{idA: qA, idB: qB}
+	require.NotNil(t, s.Pick(0, queues))
+
+	// alpha never dispatched (newcomer member, zero lastDispatch); beta warm.
+	gtDispatch(s, "beta")
+	stB := s.getOrCreateState("beta")
+	stB.mu.Lock()
+	stB.lastDispatch = now.Add(-30 * time.Second)
+	stB.mu.Unlock()
+
+	got := s.Pick(0, queues)
+	require.NotNil(t, got)
+	assert.Equal(t, "beta", got.FlowKey().ID, "warm member beats the never-dispatched newcomer (no prefix to save)")
+}

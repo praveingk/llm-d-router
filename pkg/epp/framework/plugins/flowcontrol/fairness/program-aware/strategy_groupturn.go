@@ -236,6 +236,11 @@ type groupTurnStrategy struct {
 	creditPolicy    string
 	holdDuration    time.Duration
 	halfLifeSeconds float64
+	// urgencySeconds enables warmth-EDF member ordering when > 0: warm members
+	// (next dispatch still inside the decay knee) are served first, earliest
+	// expiry first — dispatching re-reads and refreshes a prefix that is about
+	// to age out. Cold members (deadline passed, loss sunk) fall back to LRS.
+	urgencySeconds time.Duration
 
 	state sync.Map // program ID (string) -> *groupTurnState
 
@@ -436,23 +441,38 @@ func entrantBetter(policy string, svc float64, enq time.Time, id string, bestSvc
 	return id < bestID
 }
 
-// pickLRSMemberLocked returns the waiting member with the oldest lastDispatch
-// (least recently served). A never-dispatched member (zero time) wins, so
-// newcomers and returning members go first.
+// pickLRSMemberLocked returns the waiting member to dispatch next. With
+// urgencySeconds > 0 (warmth-EDF), warm members — those whose prefix is still
+// inside the decay knee (now - lastDispatch < urgency) — are served first,
+// earliest expiry first (the oldest warm member is closest to losing its
+// cache; dispatching re-reads and refreshes it). A never-dispatched member is
+// cold by definition (no prefix to save). When no member is warm, the rule
+// falls back to least-recently-served order over all waiting members.
 func (s *groupTurnStrategy) pickLRSMemberLocked(waiting []groupTurnWaiting) string {
-	best := ""
-	var bestDispatch, bestEnq time.Time
+	bestWarm, bestAny := "", ""
+	var bestWarmDispatch, bestAnyDispatch, bestWarmEnq, bestAnyEnq time.Time
+	now := time.Now()
+	useUrgency := s.urgencySeconds > 0
 	for _, w := range waiting {
 		if _, ok := s.group[w.id]; !ok {
 			continue
 		}
 		_, _, _, lastDispatch, _ := s.getOrCreateState(w.id).snapshot()
-		if best == "" || lastDispatch.Before(bestDispatch) ||
-			(lastDispatch.Equal(bestDispatch) && w.headEnq.Before(bestEnq)) {
-			best, bestDispatch, bestEnq = w.id, lastDispatch, w.headEnq
+		if bestAny == "" || lastDispatch.Before(bestAnyDispatch) ||
+			(lastDispatch.Equal(bestAnyDispatch) && w.headEnq.Before(bestAnyEnq)) {
+			bestAny, bestAnyDispatch, bestAnyEnq = w.id, lastDispatch, w.headEnq
+		}
+		if useUrgency && now.Sub(lastDispatch) < s.urgencySeconds {
+			if bestWarm == "" || lastDispatch.Before(bestWarmDispatch) ||
+				(lastDispatch.Equal(bestWarmDispatch) && w.headEnq.Before(bestWarmEnq)) {
+				bestWarm, bestWarmDispatch, bestWarmEnq = w.id, lastDispatch, w.headEnq
+			}
 		}
 	}
-	return best
+	if bestWarm != "" {
+		return bestWarm
+	}
+	return bestAny
 }
 
 // pickVictimLocked returns the member to evict on the all-idle trigger:

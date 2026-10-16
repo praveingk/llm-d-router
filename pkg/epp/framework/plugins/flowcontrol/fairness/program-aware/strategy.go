@@ -66,6 +66,7 @@ func newStrategy(cfg Config) (Strategy, error) {
 			creditPolicy:    cfg.GroupTurnCreditPolicy,
 			holdDuration:    time.Duration(cfg.GroupTurnHoldSeconds * float64(time.Second)),
 			halfLifeSeconds: cfg.GroupTurnHalfLifeSeconds,
+			urgencySeconds:  time.Duration(cfg.GroupTurnUrgencySeconds * float64(time.Second)),
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown scoring strategy %q: only \"las\", \"turn-priority\" and \"group-turn\" are supported", cfg.Strategy)

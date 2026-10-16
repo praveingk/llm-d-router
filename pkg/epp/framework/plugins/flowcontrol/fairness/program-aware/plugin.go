@@ -58,6 +58,7 @@ type Config struct {
 	GroupTurnCreditPolicy    string  `json:"groupTurnCreditPolicy,omitempty"`
 	GroupTurnHoldSeconds     float64 `json:"groupTurnHoldSeconds,omitempty"`
 	GroupTurnHalfLifeSeconds float64 `json:"groupTurnHalfLifeSeconds,omitempty"`
+	GroupTurnUrgencySeconds  float64 `json:"groupTurnUrgencySeconds,omitempty"`
 }
 
 func DefaultConfig() Config {
@@ -79,6 +80,7 @@ func DefaultConfig() Config {
 		GroupTurnCreditPolicy:    groupTurnCreditKeep,
 		GroupTurnHoldSeconds:     120,
 		GroupTurnHalfLifeSeconds: 60,
+		GroupTurnUrgencySeconds:  0,
 	}
 }
 
@@ -130,6 +132,9 @@ func (c Config) validate() error {
 	}
 	if c.GroupTurnHalfLifeSeconds < 0 {
 		return fmt.Errorf("groupTurnHalfLifeSeconds must be >= 0, got %v", c.GroupTurnHalfLifeSeconds)
+	}
+	if c.GroupTurnUrgencySeconds < 0 {
+		return fmt.Errorf("groupTurnUrgencySeconds must be >= 0, got %v", c.GroupTurnUrgencySeconds)
 	}
 	return nil
 }
