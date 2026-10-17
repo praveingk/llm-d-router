@@ -49,23 +49,23 @@ var (
 )
 
 const (
-	sbGCadence      = 60 * time.Second   // G controller sampling cadence
-	sbGEWMAUp       = 120 * time.Second  // fast toward danger (rising running set)
-	sbGEWMADown     = 600 * time.Second  // slow away (lull dips must not shrink)
-	sbGGrowStep     = 32                 // max seats added per update
-	sbGShrinkStep   = 8                  // max seats dropped per update (non-refill)
-	sbGSensorFreeze = 3                  // flat-lined polls before freezing G
-	sbShrinkMinAge  = 15 * time.Minute   // no shrink during cold start
-	sbShrinkMaxAdm  = 8.0                // no shrink while admissions hot (per min)
-	sbTauEvalEvery  = 120 * time.Second  // τ readout cadence
-	sbTauEWMA       = 600 * time.Second  // bin estimator time constant
-	sbTauDeadband   = 0.35               // octaves
-	sbTauFlipSignal = 0.75               // octaves; latch trigger
-	sbTauLatchLock  = 20 * time.Minute   // flip direction lock
-	sbTauStep       = 1.10               // geometric step toward τ̂
-	sbTauCrossFreez = 10 * time.Minute   // τ frozen after any G action
-	sbTauMinSamples = 30.0               // re-entry samples / 10 min to act
-	sbBinMinSamples = 25.0               // effective samples for a valid bin
+	sbGCadence      = 60 * time.Second  // G controller sampling cadence
+	sbGEWMAUp       = 120 * time.Second // fast toward danger (rising running set)
+	sbGEWMADown     = 600 * time.Second // slow away (lull dips must not shrink)
+	sbGGrowStep     = 32                // max seats added per update
+	sbGShrinkStep   = 8                 // max seats dropped per update (non-refill)
+	sbGSensorFreeze = 3                 // flat-lined polls before freezing G
+	sbShrinkMinAge  = 15 * time.Minute  // no shrink during cold start
+	sbShrinkMaxAdm  = 8.0               // no shrink while admissions hot (per min)
+	sbTauEvalEvery  = 120 * time.Second // τ readout cadence
+	sbTauEWMA       = 600 * time.Second // bin estimator time constant
+	sbTauDeadband   = 0.35              // octaves
+	sbTauFlipSignal = 0.75              // octaves; latch trigger
+	sbTauLatchLock  = 20 * time.Minute  // flip direction lock
+	sbTauStep       = 1.10              // geometric step toward τ̂
+	sbTauCrossFreez = 10 * time.Minute  // τ frozen after any G action
+	sbTauMinSamples = 30.0              // re-entry samples / 10 min to act
+	sbBinMinSamples = 25.0              // effective samples for a valid bin
 	sbKneeFloor     = 30 * time.Second
 )
 
@@ -101,43 +101,43 @@ type sbState struct {
 	mu sync.Mutex
 
 	// G controller
-	runningEWMA   float64
-	lastSampleT   time.Time
-	lastR         float64
-	flatPolls     int
-	currentG      int
-	shrinkStreak  int     // consecutive polls above the shrink band
-	admitRate     float64 // entrant admissions per minute (5-min EWMA)
-	admitWindow   float64 // admissions seen since last cadence tick
-	admitLastT    time.Time
-	startedAt     time.Time
-	lastGActionT  time.Time
-	gLastTick     time.Time
-	tauLastTick   time.Time
+	runningEWMA  float64
+	lastSampleT  time.Time
+	lastR        float64
+	flatPolls    int
+	currentG     int
+	shrinkStreak int     // consecutive polls above the shrink band
+	admitRate    float64 // entrant admissions per minute (5-min EWMA)
+	admitWindow  float64 // admissions seen since last cadence tick
+	admitLastT   time.Time
+	startedAt    time.Time
+	lastGActionT time.Time
+	gLastTick    time.Time
+	tauLastTick  time.Time
 
 	// τ controller (gap bins: [0,30) plateau-ref; 30-60, 60-120, 120-240,
 	// 240-480; [480,inf) floor-ref)
-	bins         [6]sbTokenEWMA
-	binsLastT    [6]time.Time
-	sampleCount  float64 // decayed re-entry samples (~10 min memory)
-	sampleLastT  time.Time
-	currentKnee  time.Duration
-	evalStreak   int // consecutive evaluations outside deadband
-	flipStreak   int // consecutive evaluations past the flip signal
-	latchDir     int // -1 down, +1 up, 0 none
-	latchUntil   time.Time
+	bins        [6]sbTokenEWMA
+	binsLastT   [6]time.Time
+	sampleCount float64 // decayed re-entry samples (~10 min memory)
+	sampleLastT time.Time
+	currentKnee time.Duration
+	evalStreak  int // consecutive evaluations outside deadband
+	flipStreak  int // consecutive evaluations past the flip signal
+	latchDir    int // -1 down, +1 up, 0 none
+	latchUntil  time.Time
 }
 
 func newSBState(gMax int, kneeMax time.Duration) *sbState {
 	now := time.Now()
 	return &sbState{
-		currentG:     gMax,
-		startedAt:    now,
-		admitLastT:   now,
-		sampleLastT:  now,
-		gLastTick:    now,
-		tauLastTick:  now,
-		currentKnee:  60 * time.Second,
+		currentG:    gMax,
+		startedAt:   now,
+		admitLastT:  now,
+		sampleLastT: now,
+		gLastTick:   now,
+		tauLastTick: now,
+		currentKnee: 60 * time.Second,
 	}
 }
 

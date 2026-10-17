@@ -126,6 +126,7 @@ type groupTurnState struct {
 	stayStart       int64     // dispatchedTotal snapshot when the current stay began
 	lastDispatch    time.Time // for least-recently-served ordering among members
 	lastActivity    time.Time // last dispatch or completion; drives hold time and victim choice
+	lastPrompt      float64   // engine-reported prompt tokens of the last completed request (cold-charge scale)
 	inFlight        int64
 	pendingGap      time.Duration // inter-dispatch gap captured at dispatch (τ estimator input)
 }
@@ -211,11 +212,12 @@ func (st *groupTurnState) takePendingGap() time.Duration {
 	return g
 }
 
-func (st *groupTurnState) RecordCompletion(now time.Time) {
+func (st *groupTurnState) RecordCompletion(now time.Time, promptTokens float64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.inFlight--
 	st.lastActivity = now
+	st.lastPrompt = promptTokens
 }
 
 func (st *groupTurnState) BeginStay(now time.Time) {
@@ -293,10 +295,14 @@ type groupTurnStrategy struct {
 	group   map[string]struct{} // member IDs; guarded by groupMu
 
 	// Global running mean of completion costs; bootstraps the pending-service
-	// estimate for programs with no completion history.
+	// estimate for programs with no completion history. promptSum/promptCount
+	// carry the same statistics for PROMPT tokens — the cold-charge scale for
+	// newcomer sessions under the knee-keyed estimator.
 	pendingMu    sync.Mutex
 	pendingSum   float64
 	pendingCount int64
+	promptSum    float64
+	promptCount  int64
 }
 
 // waitingOutsideCount returns how many queued non-member sessions are waiting
@@ -334,6 +340,11 @@ func (s *groupTurnStrategy) warmKnee() time.Duration {
 
 const groupTurnDefaultMeanCost = 1000
 
+// groupTurnDefaultMeanPrompt bootstraps the cold charge for newcomer sessions
+// (no completion history yet) until real completions establish the running
+// mean — mid-range for agentic contexts (p0a: mean ~34k, p75 50k).
+const groupTurnDefaultMeanPrompt = 32768.0
+
 func (s *groupTurnStrategy) globalMeanCost() float64 {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
@@ -341,6 +352,15 @@ func (s *groupTurnStrategy) globalMeanCost() float64 {
 		return groupTurnDefaultMeanCost
 	}
 	return s.pendingSum / float64(s.pendingCount)
+}
+
+func (s *groupTurnStrategy) globalMeanPrompt() float64 {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if s.promptCount == 0 {
+		return groupTurnDefaultMeanPrompt
+	}
+	return s.promptSum / float64(s.promptCount)
 }
 
 func (s *groupTurnStrategy) Name() string { return groupTurnStrategyName }
@@ -702,12 +722,15 @@ func (s *groupTurnStrategy) OnCompleted(_ *ProgramMetrics, request *fwksched.Inf
 	id := programIDFor(request)
 	st := s.getOrCreateState(id)
 	now := time.Now()
-	st.RecordCompletion(now)
+	promptTokens := float64(response.Usage.PromptTokens)
+	st.RecordCompletion(now, promptTokens)
 	cost := float64(weightInputToken*int64(response.Usage.PromptTokens) + weightOutputToken*int64(response.Usage.CompletionTokens))
 	st.AddService(cost)
 	s.pendingMu.Lock()
 	s.pendingSum += cost
 	s.pendingCount++
+	s.promptSum += promptTokens
+	s.promptCount++
 	s.pendingMu.Unlock()
 	if s.adaptive && s.sb != nil {
 		if gap := st.takePendingGap(); gap > 0 && response.Usage.PromptTokenDetails != nil {

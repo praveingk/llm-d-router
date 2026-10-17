@@ -73,6 +73,9 @@ func newStrategy(cfg Config) (Strategy, error) {
 			coldBudgetTokensPerSec: cfg.GroupTurnColdBudgetTokensPerSec,
 			coldBudgetTenants:      cfg.GroupTurnColdBudgetTenants,
 		}
+		// The knee-keyed estimator is the production charge source (see
+		// strategy_groupturn_cold.go); tests and future sources override it.
+		gt.coldCharge = gt.kneeKeyedColdCharge
 		if gt.adaptive {
 			gt.sb = newSBState(gt.gMax, gt.kneeMax)
 		}

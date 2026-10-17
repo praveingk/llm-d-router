@@ -165,14 +165,14 @@ func (c Config) validate() error {
 		return fmt.Errorf("groupTurnColdBudgetTenants must be >= 1 when the cold budget is set, got %v", c.GroupTurnColdBudgetTenants)
 	}
 	if c.GroupTurnColdBudgetTokensPerSec > 0 {
-		// DESIGN BLOCKER (task/turn-group-scheduler, p9 + p7b): the budget's
-		// charge basis is the prefix producer's per-request predicted match,
-		// which is computed only after the flow-control dequeue and so is not
-		// readable at Pick time, where deferral is decided. The mechanics are
-		// implemented (strategy_groupturn_cold.go) behind the coldCharge seam;
-		// refuse to enable the budget rather than run it inert or on an
-		// improvised charge basis.
-		return fmt.Errorf("groupTurnColdBudgetTokensPerSec > 0 is not enableable yet: no Pick-time cold-charge prediction source is wired (the approx-prefix producer predicts only after the flow-control dequeue; see task/turn-group-scheduler/logs/p9-index-calibration.md and p7b-cwc-review.md)")
+		// The budget's charge source is the knee-keyed estimator
+		// (strategy_groupturn_cold.go), which classifies warmth by the same
+		// knee the warmth-EDF pick uses. Without a knee every request is cold
+		// and the budget degenerates into a prompt-denominated one — the
+		// denomination p7 measured converting rationing into idleness.
+		if !c.GroupTurnAdaptive && c.GroupTurnUrgencySeconds <= 0 {
+			return fmt.Errorf("groupTurnColdBudgetTokensPerSec > 0 requires a warmth knee for its charge estimator: set groupTurnUrgencySeconds > 0 or enable groupTurnAdaptive")
+		}
 	}
 	return nil
 }

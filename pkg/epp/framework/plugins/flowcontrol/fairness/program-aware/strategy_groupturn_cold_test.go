@@ -347,15 +347,28 @@ func TestGroupTurnCold_ConfigValidation(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "groupTurnColdBudgetTenants", "tenant sanity checked ahead of the blocker")
 
-	// The design blocker: a positive budget is refused until a Pick-time
-	// charge source is wired (see strategy_groupturn_cold.go).
+	// The knee requirement: the estimator classifies warmth by the warmth
+	// knee, so a budget without one degenerates to prompt denomination (the
+	// p7 idleness failure mode) and is refused.
 	cfg = DefaultConfig()
 	cfg.Strategy = groupTurnStrategyName
 	cfg.GroupTurnColdBudgetTokensPerSec = 9000
-	cfg.GroupTurnColdBudgetTenants = 2
 	err = cfg.validate()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not enableable yet", "positive budget refused loudly (design blocker)")
+	assert.Contains(t, err.Error(), "warmth knee", "budget without a knee refused")
+
+	// Budget on with a knee (fixed or adaptive): valid.
+	cfg = DefaultConfig()
+	cfg.Strategy = groupTurnStrategyName
+	cfg.GroupTurnColdBudgetTokensPerSec = 9000
+	cfg.GroupTurnUrgencySeconds = 60
+	require.NoError(t, cfg.validate())
+
+	cfg = DefaultConfig()
+	cfg.Strategy = groupTurnStrategyName
+	cfg.GroupTurnColdBudgetTokensPerSec = 9000
+	cfg.GroupTurnAdaptive = true
+	require.NoError(t, cfg.validate(), "adaptive provides the knee (sb bootstrap 60s, clamped [30, kneeMax])")
 }
 
 func TestGroupTurnCold_Wiring(t *testing.T) {
@@ -367,7 +380,7 @@ func TestGroupTurnCold_Wiring(t *testing.T) {
 	require.True(t, ok)
 	assert.Zero(t, gt.coldBudgetTokensPerSec, "budget off by default")
 	assert.Equal(t, 2, gt.coldBudgetTenants)
-	assert.Nil(t, gt.coldCharge, "no production charge source wired")
+	assert.NotNil(t, gt.coldCharge, "knee-keyed estimator wired even with the budget off (inert until enabled)")
 
 	cfg.GroupTurnColdBudgetTokensPerSec = 9000
 	cfg.GroupTurnColdBudgetTenants = 4
@@ -377,4 +390,147 @@ func TestGroupTurnCold_Wiring(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 9000.0, gt.coldBudgetTokensPerSec)
 	assert.Equal(t, 4, gt.coldBudgetTenants)
+	assert.NotNil(t, gt.coldCharge, "knee-keyed estimator wired as the production charge source")
+}
+
+func newKneeKeyed(groupSize int, quota int64, budget float64) *groupTurnStrategy {
+	s := newGroupTurn(groupSize, quota)
+	s.coldBudgetTokensPerSec = budget
+	s.coldBudgetTenants = 2
+	s.urgencySeconds = 60 * time.Second
+	s.coldCharge = s.kneeKeyedColdCharge
+	return s
+}
+
+func TestGroupTurnCold_KneeKeyed_WarmNeverCharged(t *testing.T) {
+	s := newKneeKeyed(4, 100, 9000)
+	gtDispatch(s, "alpha")
+	gtComplete(s, "alpha", 10000, 500) // lastPrompt = 10000
+	st := s.getOrCreateState("alpha")
+	st.mu.Lock()
+	st.lastDispatch = time.Now().Add(-30 * time.Second) // inside the 60 s knee
+	st.mu.Unlock()
+
+	charge, ok := s.coldCharge(&fwksched.InferenceRequest{FairnessID: "alpha"})
+	require.True(t, ok)
+	assert.Zero(t, charge, "warm session (gap inside the knee) charges zero — the ratchet")
+}
+
+func TestGroupTurnCold_KneeKeyed_ColdChargesLastPrompt(t *testing.T) {
+	s := newKneeKeyed(4, 100, 9000)
+	gtDispatch(s, "alpha")
+	gtComplete(s, "alpha", 10000, 500)
+	st := s.getOrCreateState("alpha")
+	st.mu.Lock()
+	st.lastDispatch = time.Now().Add(-120 * time.Second) // beyond the knee
+	st.mu.Unlock()
+
+	charge, ok := s.coldCharge(&fwksched.InferenceRequest{FairnessID: "alpha"})
+	require.True(t, ok)
+	assert.InDelta(t, 10000.0, charge, 1e-9, "cold re-entry charges the last-known prompt size (the re-prefill scale)")
+
+	// Freshly-created state (dispatched but never completed, and past the
+	// knee): falls to the global mean, not zero.
+	gtDispatch(s, "beta")
+	bst := s.getOrCreateState("beta")
+	bst.mu.Lock()
+	bst.lastDispatch = time.Now().Add(-120 * time.Second)
+	bst.mu.Unlock()
+	mean := s.globalMeanPrompt()
+	charge, ok = s.coldCharge(&fwksched.InferenceRequest{FairnessID: "beta"})
+	require.True(t, ok)
+	assert.InDelta(t, mean, charge, 1e-9, "no completion history: the global mean prompt")
+}
+
+func TestGroupTurnCold_KneeKeyed_NewcomerGlobalMean(t *testing.T) {
+	s := newKneeKeyed(4, 100, 9000)
+	// No completions anywhere yet: the bootstrap constant.
+	charge, ok := s.coldCharge(&fwksched.InferenceRequest{FairnessID: "new-session"})
+	require.True(t, ok)
+	assert.InDelta(t, groupTurnDefaultMeanPrompt, charge, 1e-9)
+
+	// After completions land, the running mean takes over.
+	for i := 0; i < 10; i++ {
+		gtComplete(s, fmt.Sprintf("sess-%d", i), 2000, 10)
+	}
+	charge, ok = s.coldCharge(&fwksched.InferenceRequest{FairnessID: "another-new-session"})
+	require.True(t, ok)
+	assert.InDelta(t, 2000.0, charge, 1e-9, "newcomer charge tracks the global running mean prompt")
+}
+
+func TestGroupTurnCold_KneeKeyed_AdaptiveKneeInteraction(t *testing.T) {
+	// Adaptive: the estimator must use the CONTROLLER's knee, not the
+	// configured urgency bootstrap.
+	s := newAdaptive(256)
+	s.coldBudgetTokensPerSec = 9000
+	s.coldBudgetTenants = 2
+	s.coldCharge = s.kneeKeyedColdCharge
+	s.sb.mu.Lock()
+	s.sb.currentKnee = 120 * time.Second
+	s.sb.mu.Unlock()
+
+	gtDispatch(s, "alpha")
+	gtComplete(s, "alpha", 8000, 100)
+	st := s.getOrCreateState("alpha")
+	st.mu.Lock()
+	st.lastDispatch = time.Now().Add(-90 * time.Second) // beyond 60 s, inside 120 s
+	st.mu.Unlock()
+
+	charge, ok := s.coldCharge(&fwksched.InferenceRequest{FairnessID: "alpha"})
+	require.True(t, ok)
+	assert.Zero(t, charge, "adaptive knee 120 s: a 90 s gap is warm")
+
+	// The same gap under the fixed 60 s knee is cold.
+	fixed := newKneeKeyed(4, 100, 9000)
+	gtDispatch(fixed, "alpha")
+	gtComplete(fixed, "alpha", 8000, 100)
+	fst := fixed.getOrCreateState("alpha")
+	fst.mu.Lock()
+	fst.lastDispatch = time.Now().Add(-90 * time.Second)
+	fst.mu.Unlock()
+	charge, ok = fixed.coldCharge(&fwksched.InferenceRequest{FairnessID: "alpha"})
+	require.True(t, ok)
+	assert.InDelta(t, 8000.0, charge, 1e-9, "fixed 60 s knee: the same 90 s gap is cold")
+}
+
+func TestGroupTurnCold_KneeKeyed_PickEndToEnd(t *testing.T) {
+	// The default estimator through the full Pick path: a warm session
+	// dispatches freely; a cold re-entry with an unaffordable last-prompt
+	// defers; after the bucket refills it dispatches and is charged.
+	s := newKneeKeyed(4, 100, 200) // 100/tenant, capacity 1000
+	gtDispatch(s, "alpha")
+	gtComplete(s, "alpha", 500, 10) // lastPrompt = 500 (< capacity)
+	st := s.getOrCreateState("alpha")
+	st.mu.Lock()
+	st.lastDispatch = time.Now().Add(-120 * time.Second) // cold re-entry
+	st.mu.Unlock()
+
+	idA, qA := makeInfoReq("alpha", time.Now())
+	queues := map[string]QueueInfo{idA: qA}
+
+	// First encounter: the bucket starts full, so alpha's 500-token cold
+	// charge is affordable (debt semantics would allow even larger).
+	assert.NotNil(t, s.Pick(0, queues), "first encounter dispatches on the full bucket")
+
+	gtComplete(s, "alpha", 500, 10)
+	st.mu.Lock()
+	st.lastDispatch = time.Now().Add(-120 * time.Second)
+	st.mu.Unlock()
+	drainColdBucket(s, "alpha", 100, time.Now())
+	assert.Nil(t, s.Pick(0, queues), "cold re-entry with a drained bucket is deferred")
+	_, deferred := s.coldDeferUntil["alpha"]
+	assert.True(t, deferred)
+
+	// Warm gap: never deferred, whatever the bucket.
+	st.mu.Lock()
+	st.lastDispatch = time.Now().Add(-10 * time.Second)
+	st.mu.Unlock()
+	tenant := s.coldTenantOf("alpha")
+	s.groupMu.Lock()
+	delete(s.coldDeferUntil, "alpha")
+	s.coldBucketLocked(tenant, time.Now()).credit = 0
+	s.groupMu.Unlock()
+	got := s.Pick(0, queues)
+	require.NotNil(t, got)
+	assert.Equal(t, "alpha", got.FlowKey().ID, "warm gap dispatches even with an empty bucket — the ratchet")
 }

@@ -19,21 +19,18 @@ package programaware
 // exactly the configured rate (the scratch documented the livelock and the
 // fix; both are preserved here).
 //
-// DESIGN BLOCKER — the charge source is intentionally UNWIRED. The charge
-// basis is the prefix producer's per-request prediction (prompt tokens −
-// predicted cached tokens), which p9 calibrated on the fixed index
-// (lruCapacityPerServer 10038 + real-token tokenizer) at +0.104 material-
-// charge optimism — inside the ≤20% survival bar. But that prediction is
-// computed AFTER the flow-control dequeue: the producer runs in
-// runDataProducerPlugins (director.go), which executes once Pick has released
-// the request, and request.Body.TokenizedRequest is likewise populated only
-// by the post-dequeue token producer. Nothing prefix-related exists for a
-// request that is still queued, so the prediction is NOT accessible at Pick
-// time, where the defer-or-dispatch decision must happen. Config validation
-// therefore REFUSES groupTurnColdBudgetTokensPerSec > 0 until a Pick-time
-// charge source is wired; coldCharge below is the seam. The bucket, deferral
-// and selection mechanics are complete and unit-tested so the wiring is the
-// only remaining piece (p7b live-arm spec item 1 is the requirement).
+// DESIGN — why the charge is knee-keyed and not the prefix index. The
+// natural charge basis (the prefix producer's per-request prediction,
+// p9-calibrated at +0.104 on the fixed index) is computed AFTER the
+// flow-control dequeue: the producer runs in runDataProducerPlugins
+// (director.go), which executes once Pick has released the request, and
+// request.Body.TokenizedRequest is likewise populated only by the post-dequeue
+// token producer. Nothing prefix-related exists for a request that is still
+// queued, so the prediction is NOT accessible at Pick time, where the
+// defer-or-dispatch decision must happen. The kneeKeyedColdCharge estimator
+// below is the chosen Pick-time source (in-strategy state only, bounded
+// pessimism); the seam remains for a future index-backed source if the
+// pipeline ever tokenizes pre-dequeue.
 //
 // Known deviation from the scratch, by construction of the router's event
 // model: the sim scheduled a wake event at the earliest deferral expiry so a
@@ -113,12 +110,59 @@ var (
 )
 
 // coldChargeEstimator predicts the cold-write tokens (prompt − predicted
-// cached) for a request about to be dispatched. ok=false means "no prediction
-// available": the request is treated as warm and counted — missing data must
-// not gate dispatch (the prompt-denominated failure mode p7b measured
-// converts rationing into idleness). The production source is unwired (see
-// the file comment); tests inject stubs.
+// cached) for a request about to be dispatched. ok=false means "no
+// prediction available": the request is treated as warm and counted — missing
+// data must not gate dispatch (the prompt-denominated failure mode p7b
+// measured converts rationing into idleness). The production source is the
+// knee-keyed estimator below; tests inject stubs.
 type coldChargeEstimator func(request *fwksched.InferenceRequest) (coldTokens float64, ok bool)
+
+// kneeKeyedColdCharge is the production coldChargeEstimator: an in-strategy
+// predictor keyed on the warmth knee rather than the prefix index — the
+// producer's prediction is only available post-dequeue (see the top-of-file
+// data-path finding), so the charge rides on the strategy's own measured
+// warmth model instead:
+//
+//   - WARM sessions (gap since last dispatch inside the knee) charge ZERO —
+//     exactly the classification the warmth-EDF pick uses, so a request the
+//     pick rule treats as warm is never gated (the ratchet).
+//   - COLD sessions (gap beyond the knee, including first requests of
+//     re-entering sessions) charge their LAST-KNOWN prompt size: a cold
+//     re-entry re-prefills its full context, and the surviving fraction
+//     (~0.35–0.53 hit at 2× knee, exp3) makes this a bounded PESSIMISTIC
+//     charge — the safe direction for a budget, since optimism breaks the
+//     bind phase (p7). The pessimism is compensated by calibrating b offline
+//     against the target workload (experiments/analysis/tgroup/p10_knee_estimator.py).
+//   - NEWCOMERS (no completion history) charge the global running mean
+//     prompt, bootstrapped at groupTurnDefaultMeanPrompt until completions
+//     land — the cold carousel they arrive in is exactly the phase the
+//     budget must ration.
+//
+// The knee is warmKnee(): the configured urgency window, or the adaptive
+// controller's knee when groupTurnAdaptive is on.
+func (s *groupTurnStrategy) kneeKeyedColdCharge(request *fwksched.InferenceRequest) (float64, bool) {
+	if request == nil {
+		return 0, true
+	}
+	st := s.getOrCreateState(programIDFor(request))
+	lastDispatch, lastPrompt := st.coldChargeInputs()
+	if knee := s.warmKnee(); knee > 0 && !lastDispatch.IsZero() && time.Since(lastDispatch) < knee {
+		return 0, true // warm: the ratchet
+	}
+	if lastPrompt > 0 {
+		return lastPrompt, true // cold: the re-prefill scale
+	}
+	return s.globalMeanPrompt(), true // newcomer
+}
+
+// coldChargeInputs returns the estimator's per-program inputs: the last
+// dispatch time (warmth gap anchor) and the last completed request's
+// engine-reported prompt size (cold-charge scale).
+func (st *groupTurnState) coldChargeInputs() (lastDispatch time.Time, lastPrompt float64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.lastDispatch, st.lastPrompt
+}
 
 // coldBucket is one tenant's token bucket. It starts full (the scratch
 // initializes [rate×burst_s, 0]); credit may go negative (debt semantics).
