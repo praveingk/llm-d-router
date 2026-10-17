@@ -223,7 +223,10 @@ func (s *groupTurnStrategy) sbRunningCount() int64 {
 }
 
 // stepG runs one G-controller update (call at most once per sbGCadence).
-func (sb *sbState) stepG(r int64, gMax int, now time.Time) {
+// waitingOutside is the current count of queued non-members (drain-freeze:
+// with nothing waiting outside, membership gates nothing and shrinking is
+// pointless churn — hold).
+func (sb *sbState) stepG(r int64, gMax int, now time.Time, waitingOutside int) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
@@ -279,6 +282,12 @@ func (sb *sbState) stepG(r int64, gMax int, now time.Time) {
 			sb.shrinkStreak = 0
 		}
 	case float64(sb.currentG)-rBar > mHi:
+		// Drain-freeze: no outsiders waiting means membership gates nothing;
+		// shrinking would only churn the tail.
+		if waitingOutside == 0 {
+			sb.shrinkStreak = 0
+			break
+		}
 		sb.shrinkStreak++
 		// Triple gate: past cold start, admissions not hot, persistence.
 		if sb.shrinkStreak >= 3 &&

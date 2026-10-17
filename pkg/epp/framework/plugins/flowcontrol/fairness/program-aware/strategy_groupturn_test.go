@@ -486,7 +486,7 @@ func TestSB_G_ShrinksSlowlyIntoBandThenGrows(t *testing.T) {
 	now := time.Now()
 	prev := 256
 	for i := 1; i <= 40; i++ {
-		sb.stepG(int64(150+i%3-1), 256, now.Add(time.Duration(i)*time.Minute))
+		sb.stepG(int64(150+i%3-1), 256, now.Add(time.Duration(i)*time.Minute), 10)
 		g := sb.effectiveG()
 		assert.LessOrEqual(t, prev-g, 8, "shrink is non-refill, at most 8 per update")
 		assert.GreaterOrEqual(t, g, 16)
@@ -500,7 +500,7 @@ func TestSB_G_ShrinksSlowlyIntoBandThenGrows(t *testing.T) {
 
 	// Running set jumps to 240: grow is immediate, +32 capped, bounded by gMax.
 	for i := 1; i <= 6; i++ {
-		sb.stepG(int64(240+i%3-1), 256, now.Add(time.Duration(40+i)*time.Minute))
+		sb.stepG(int64(240+i%3-1), 256, now.Add(time.Duration(40+i)*time.Minute), 10)
 	}
 	assert.Equal(t, 256, sb.effectiveG(), "grows back to the cap")
 }
@@ -511,16 +511,16 @@ func TestSB_G_ShortLullDoesNotShrink(t *testing.T) {
 	// Converge with running≈150 (jittered like a real gauge) for 30 min: G
 	// settles in the band with the shrink streak reset.
 	for i := 1; i <= 30; i++ {
-		sb.stepG(int64(150+i%3-1), 256, now.Add(time.Duration(i)*time.Minute))
+		sb.stepG(int64(150+i%3-1), 256, now.Add(time.Duration(i)*time.Minute), 10)
 	}
 	gBefore := sb.effectiveG()
 	// A single 60s lull poll at r=80: the asymmetric (slow-down) filter keeps
 	// rbar high enough that the shrink streak (k=3) cannot complete in one
 	// poll — G must not shrink.
-	sb.stepG(80, 256, now.Add(31*time.Minute))
+	sb.stepG(80, 256, now.Add(31*time.Minute), 10)
 	assert.Equal(t, gBefore, sb.effectiveG(), "one lull poll must not shrink G")
 	// A second lull poll: streak is 2 of 3 — still no shrink.
-	sb.stepG(80, 256, now.Add(32*time.Minute))
+	sb.stepG(80, 256, now.Add(32*time.Minute), 10)
 	assert.Equal(t, gBefore, sb.effectiveG(), "two lull polls must not shrink G (k=3 guard)")
 }
 
@@ -620,4 +620,20 @@ func TestSB_ConfigValidation(t *testing.T) {
 	assert.NotNil(t, gt.sb)
 	assert.Equal(t, 256, gt.gMax)
 	assert.Equal(t, 120*time.Second, gt.kneeMax)
+}
+
+func TestSB_G_DrainFreezeHolds(t *testing.T) {
+	sb := newSBState(256, 120*time.Second)
+	now := time.Now()
+	// Converge with waiting outsiders present (shrink allowed): G enters the band.
+	for i := 1; i <= 30; i++ {
+		sb.stepG(int64(150+i%3-1), 256, now.Add(time.Duration(i)*time.Minute), 10)
+	}
+	gBefore := sb.effectiveG()
+	// Drain: running falls, nothing waits outside. The drain-freeze must hold G
+	// (shrinking without contention is pointless churn).
+	for i := 1; i <= 10; i++ {
+		sb.stepG(int64(100+i%3-1), 256, now.Add(time.Duration(30+i)*time.Minute), 0)
+	}
+	assert.Equal(t, gBefore, sb.effectiveG(), "drain (no outsiders waiting) must not shrink G")
 }

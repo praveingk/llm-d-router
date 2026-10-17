@@ -286,6 +286,22 @@ type groupTurnStrategy struct {
 	pendingCount int64
 }
 
+// waitingOutsideCount returns how many queued non-member sessions are waiting
+// right now (the G controller's drain-freeze input).
+func (s *groupTurnStrategy) waitingOutsideCount(queues map[string]QueueInfo) int {
+	s.groupMu.Lock()
+	defer s.groupMu.Unlock()
+	n := 0
+	for id, qi := range queues {
+		if qi.Len > 0 {
+			if _, ok := s.group[id]; !ok {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // effectiveGroupSize returns the current membership bound (controller-driven
 // when adaptive, the configured size otherwise).
 func (s *groupTurnStrategy) effectiveGroupSize() int {
@@ -343,7 +359,7 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 	// Self-balancing controllers (slow clocks, own locks; fairness untouched).
 	if s.adaptive && s.sb != nil {
 		if s.sb.tickG(now) {
-			s.sb.stepG(s.sbRunningCount(), s.gMax, now)
+			s.sb.stepG(s.sbRunningCount(), s.gMax, now, s.waitingOutsideCount(queues))
 			groupTurnGroupTarget.Set(float64(s.sb.effectiveG()))
 		}
 		if s.sb.tickTau(now) {
