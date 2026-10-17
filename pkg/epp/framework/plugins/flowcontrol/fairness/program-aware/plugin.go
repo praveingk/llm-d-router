@@ -60,9 +60,12 @@ type Config struct {
 	GroupTurnHalfLifeSeconds float64 `json:"groupTurnHalfLifeSeconds,omitempty"`
 	GroupTurnUrgencySeconds  float64 `json:"groupTurnUrgencySeconds,omitempty"`
 
-	GroupTurnAdaptive         bool    `json:"groupTurnAdaptive,omitempty"`
-	GroupTurnAdaptiveGMax     int     `json:"groupTurnAdaptiveGMax,omitempty"`
-	GroupTurnKneeMaxSeconds   float64 `json:"groupTurnKneeMaxSeconds,omitempty"`
+	GroupTurnAdaptive       bool    `json:"groupTurnAdaptive,omitempty"`
+	GroupTurnAdaptiveGMax   int     `json:"groupTurnAdaptiveGMax,omitempty"`
+	GroupTurnKneeMaxSeconds float64 `json:"groupTurnKneeMaxSeconds,omitempty"`
+
+	GroupTurnColdBudgetTokensPerSec float64 `json:"groupTurnColdBudgetTokensPerSec,omitempty"`
+	GroupTurnColdBudgetTenants      int     `json:"groupTurnColdBudgetTenants,omitempty"`
 }
 
 func DefaultConfig() Config {
@@ -89,6 +92,9 @@ func DefaultConfig() Config {
 		GroupTurnAdaptive:       false,
 		GroupTurnAdaptiveGMax:   256,
 		GroupTurnKneeMaxSeconds: 120,
+
+		GroupTurnColdBudgetTokensPerSec: 0,
+		GroupTurnColdBudgetTenants:      2,
 	}
 }
 
@@ -151,6 +157,22 @@ func (c Config) validate() error {
 		if c.GroupTurnKneeMaxSeconds < 30 || c.GroupTurnKneeMaxSeconds > 300 {
 			return fmt.Errorf("groupTurnKneeMaxSeconds must be in [30, 300], got %v", c.GroupTurnKneeMaxSeconds)
 		}
+	}
+	if c.GroupTurnColdBudgetTokensPerSec < 0 {
+		return fmt.Errorf("groupTurnColdBudgetTokensPerSec must be >= 0, got %v", c.GroupTurnColdBudgetTokensPerSec)
+	}
+	if c.GroupTurnColdBudgetTokensPerSec != 0 && c.GroupTurnColdBudgetTenants < 1 {
+		return fmt.Errorf("groupTurnColdBudgetTenants must be >= 1 when the cold budget is set, got %v", c.GroupTurnColdBudgetTenants)
+	}
+	if c.GroupTurnColdBudgetTokensPerSec > 0 {
+		// DESIGN BLOCKER (task/turn-group-scheduler, p9 + p7b): the budget's
+		// charge basis is the prefix producer's per-request predicted match,
+		// which is computed only after the flow-control dequeue and so is not
+		// readable at Pick time, where deferral is decided. The mechanics are
+		// implemented (strategy_groupturn_cold.go) behind the coldCharge seam;
+		// refuse to enable the budget rather than run it inert or on an
+		// improvised charge basis.
+		return fmt.Errorf("groupTurnColdBudgetTokensPerSec > 0 is not enableable yet: no Pick-time cold-charge prediction source is wired (the approx-prefix producer predicts only after the flow-control dequeue; see task/turn-group-scheduler/logs/p9-index-calibration.md and p7b-cwc-review.md)")
 	}
 	return nil
 }

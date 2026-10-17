@@ -59,17 +59,19 @@ func newStrategy(cfg Config) (Strategy, error) {
 		}, nil
 	case groupTurnStrategyName:
 		gt := &groupTurnStrategy{
-			groupSize:       cfg.GroupTurnSize,
-			turnQuota:       cfg.GroupTurnQuota,
-			entryPolicy:     cfg.GroupTurnEntryPolicy,
-			victimPolicy:    cfg.GroupTurnVictimPolicy,
-			creditPolicy:    cfg.GroupTurnCreditPolicy,
-			holdDuration:    time.Duration(cfg.GroupTurnHoldSeconds * float64(time.Second)),
-			halfLifeSeconds: cfg.GroupTurnHalfLifeSeconds,
-			urgencySeconds:  time.Duration(cfg.GroupTurnUrgencySeconds * float64(time.Second)),
-			adaptive:        cfg.GroupTurnAdaptive,
-			gMax:            cfg.GroupTurnAdaptiveGMax,
-			kneeMax:         time.Duration(cfg.GroupTurnKneeMaxSeconds * float64(time.Second)),
+			groupSize:              cfg.GroupTurnSize,
+			turnQuota:              cfg.GroupTurnQuota,
+			entryPolicy:            cfg.GroupTurnEntryPolicy,
+			victimPolicy:           cfg.GroupTurnVictimPolicy,
+			creditPolicy:           cfg.GroupTurnCreditPolicy,
+			holdDuration:           time.Duration(cfg.GroupTurnHoldSeconds * float64(time.Second)),
+			halfLifeSeconds:        cfg.GroupTurnHalfLifeSeconds,
+			urgencySeconds:         time.Duration(cfg.GroupTurnUrgencySeconds * float64(time.Second)),
+			adaptive:               cfg.GroupTurnAdaptive,
+			gMax:                   cfg.GroupTurnAdaptiveGMax,
+			kneeMax:                time.Duration(cfg.GroupTurnKneeMaxSeconds * float64(time.Second)),
+			coldBudgetTokensPerSec: cfg.GroupTurnColdBudgetTokensPerSec,
+			coldBudgetTenants:      cfg.GroupTurnColdBudgetTenants,
 		}
 		if gt.adaptive {
 			gt.sb = newSBState(gt.gMax, gt.kneeMax)

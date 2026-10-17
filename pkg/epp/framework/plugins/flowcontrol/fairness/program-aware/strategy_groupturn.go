@@ -274,6 +274,19 @@ type groupTurnStrategy struct {
 	kneeMax  time.Duration
 	sb       *sbState
 
+	// Cold-write budget (strategy_groupturn_cold.go): per-tenant token
+	// buckets over predicted cold tokens with per-request deferral.
+	// coldBudgetTokensPerSec <= 0 (the default) disables the layer entirely;
+	// coldCharge is the prediction seam (nil = no source wired — config
+	// validation refuses a nonzero budget in that state). Everything below
+	// is guarded by groupMu: it is touched only inside Pick's critical
+	// section and in EvictProgram.
+	coldBudgetTokensPerSec float64
+	coldBudgetTenants      int
+	coldCharge             coldChargeEstimator
+	coldBuckets            map[int]*coldBucket
+	coldDeferUntil         map[string]time.Time
+
 	state sync.Map // program ID (string) -> *groupTurnState
 
 	groupMu sync.Mutex
@@ -409,9 +422,25 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 		}
 	}
 
+	// 2-6 (seat fills, member pick, all-idle victim path, defensive fallback,
+	// turn-quota swap) plus the cold-write budget loop live in
+	// pickWithColdBudget (strategy_groupturn_cold.go); with the budget off it
+	// is the plain selection, behaviorally identical to the pre-budget
+	// strategy.
+	return s.pickWithColdBudget(waiting, now)
+}
+
+// selectCandidateLocked runs the group-turn selection over selectable — the
+// waiting flows eligible for dispatch right now — and returns the chosen
+// program ID ("" only when nothing is admissible). all carries every waiting
+// flow, cold-deferred requests included: a deferred member still has work, so
+// it must suppress the all-idle trigger exactly like a dispatchable one. With
+// the cold budget off, selectable == all and the selection is identical to
+// the pre-budget strategy.
+func (s *groupTurnStrategy) selectCandidateLocked(all, selectable []groupTurnWaiting, now time.Time) string {
 	// 2. Fill vacant seats with waiting non-members, in entry-policy order.
 	for len(s.group) < s.effectiveGroupSize() {
-		cand := s.pickEntrantLocked(waiting, now)
+		cand := s.pickEntrantLocked(selectable, now)
 		if cand == "" {
 			break
 		}
@@ -419,7 +448,7 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 	}
 
 	// 3. Candidate: the waiting member least recently served.
-	candID := s.pickLRSMemberLocked(waiting)
+	candID := s.pickLRSMemberLocked(selectable)
 
 	// 4. All-idle trigger: no member has work, but outsiders wait. Evict a
 	// victim and seat the entry-queue head. A member with an in-flight request
@@ -427,11 +456,14 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 	// next mid-turn request back into the entry queue. When no member is
 	// evictable (all in flight), the oldest waiting outsider is gap-filled
 	// without membership rather than leaving capacity idle.
-	if candID == "" {
-		if victim := s.pickVictimLocked(now); victim != "" {
-			s.removeMemberLocked(victim)
-			groupTurnVictimEvictions.Inc()
-			if ent := s.pickEntrantLocked(waiting, now); ent != "" {
+	if candID == "" && !s.anyMemberWaitingLocked(all) {
+		// Seat only an entrant whose head the cold budget could afford to
+		// dispatch (a no-op check when the budget is off): never evict a victim
+		// for a request that would immediately be deferred.
+		if ent := s.pickAffordableEntrantLocked(selectable, now); ent != "" {
+			if victim := s.pickVictimLocked(now); victim != "" {
+				s.removeMemberLocked(victim)
+				groupTurnVictimEvictions.Inc()
 				if ent == victim {
 					// Impossible (victim had no waiting request), but never
 					// re-admit the member we just evicted.
@@ -447,17 +479,18 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 
 	if candID == "" {
 		// Defensive: waiting flows exist but none admissible and no member
-		// waiting. Fall back to oldest head so dispatch never stalls.
-		return oldestWaitingQueue(waiting)
+		// waiting. Fall back to the oldest eligible head so dispatch never
+		// stalls.
+		return oldestWaitingID(s.coldSelectableLocked(selectable, now))
 	}
 
 	// 5. Turn quota: rotate the exhausted member out for the entry-queue head
 	// (only when outsiders wait); otherwise renew its stay.
 	if s.quotaExhaustedLocked(candID) {
-		if s.hasWaitingNonMemberLocked(waiting) {
+		if s.hasWaitingNonMemberLocked(selectable) {
 			s.removeMemberLocked(candID)
 			groupTurnSwaps.Inc()
-			if ent := s.pickEntrantLocked(waiting, now); ent != "" {
+			if ent := s.pickAffordableEntrantLocked(selectable, now); ent != "" {
 				s.admitMemberLocked(ent, now)
 				candID = ent
 			} else {
@@ -470,6 +503,25 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 		}
 	}
 
+	return candID
+}
+
+// anyMemberWaitingLocked reports whether any group member has a request
+// waiting right now — including members whose head is deferred by the cold
+// budget (deferred work still suppresses the all-idle trigger, so a cold
+// request can never get a warm member evicted out from under it).
+func (s *groupTurnStrategy) anyMemberWaitingLocked(waiting []groupTurnWaiting) bool {
+	for _, w := range waiting {
+		if _, ok := s.group[w.id]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// setMembershipGauges exports the group-size and waiting-outside gauges over
+// every waiting flow — cold-deferred requests included: they are waiting too.
+func (s *groupTurnStrategy) setMembershipGauges(waiting []groupTurnWaiting) {
 	outside := 0
 	for _, w := range waiting {
 		if _, ok := s.group[w.id]; !ok {
@@ -478,8 +530,16 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 	}
 	groupTurnGroupSize.Set(float64(len(s.group)))
 	groupTurnWaitingOutside.Set(float64(outside))
+}
 
-	return queues[candID].Queue
+// waitingQueue returns the queue accessor for a waiting program ID.
+func waitingQueue(waiting []groupTurnWaiting, id string) flowcontrol.FlowQueueAccessor {
+	for _, w := range waiting {
+		if w.id == id {
+			return w.qi.Queue
+		}
+	}
+	return nil
 }
 
 // pickEntrantLocked returns the waiting non-member that should join next:
@@ -615,14 +675,14 @@ func (s *groupTurnStrategy) removeMemberLocked(id string) {
 	}
 }
 
-func oldestWaitingQueue(waiting []groupTurnWaiting) flowcontrol.FlowQueueAccessor {
+func oldestWaitingID(waiting []groupTurnWaiting) string {
 	best := waiting[0]
 	for _, w := range waiting[1:] {
 		if w.headEnq.Before(best.headEnq) {
 			best = w
 		}
 	}
-	return best.qi.Queue
+	return best.id
 }
 
 func (s *groupTurnStrategy) OnPreRequest(_ *ProgramMetrics, request *fwksched.InferenceRequest) {
@@ -663,6 +723,9 @@ func (s *groupTurnStrategy) EvictProgram(id string) {
 	if s.group != nil {
 		delete(s.group, id)
 	}
+	if s.coldDeferUntil != nil {
+		delete(s.coldDeferUntil, id)
+	}
 	s.groupMu.Unlock()
 	groupTurnServiceTokens.DeleteLabelValues(id)
 }
@@ -676,5 +739,16 @@ func (s *groupTurnStrategy) Collectors() []prometheus.Collector {
 		groupTurnVictimEvictions,
 		groupTurnHoldExits,
 		groupTurnServiceTokens,
+		// Self-balancing controller gauges (defined in
+		// strategy_groupturn_sb.go; previously never registered, so they
+		// silently did not export).
+		groupTurnGroupTarget,
+		groupTurnKneeSeconds,
+		// Cold-write budget (strategy_groupturn_cold.go).
+		groupTurnColdCredit,
+		groupTurnColdChargedTokens,
+		groupTurnColdDefers,
+		groupTurnColdIdlePicks,
+		groupTurnColdNoPrediction,
 	}
 }
