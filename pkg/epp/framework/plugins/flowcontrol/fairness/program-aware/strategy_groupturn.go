@@ -127,6 +127,7 @@ type groupTurnState struct {
 	lastDispatch    time.Time // for least-recently-served ordering among members
 	lastActivity    time.Time // last dispatch or completion; drives hold time and victim choice
 	inFlight        int64
+	pendingGap      time.Duration // inter-dispatch gap captured at dispatch (τ estimator input)
 }
 
 func (st *groupTurnState) Service(now time.Time, halfLifeSeconds float64) float64 {
@@ -189,6 +190,27 @@ func (st *groupTurnState) RecordDispatch(now time.Time) {
 	st.lastActivity = now
 }
 
+// CapturePendingGap records the inter-dispatch gap for the request about to
+// be dispatched (zero when there was no prior dispatch — a first request is
+// not a re-entry and feeds no estimator bin).
+func (st *groupTurnState) CapturePendingGap(now time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.lastDispatch.IsZero() {
+		st.pendingGap = 0
+		return
+	}
+	st.pendingGap = now.Sub(st.lastDispatch)
+}
+
+func (st *groupTurnState) takePendingGap() time.Duration {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	g := st.pendingGap
+	st.pendingGap = 0
+	return g
+}
+
 func (st *groupTurnState) RecordCompletion(now time.Time) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -240,7 +262,17 @@ type groupTurnStrategy struct {
 	// (next dispatch still inside the decay knee) are served first, earliest
 	// expiry first — dispatching re-reads and refreshes a prefix that is about
 	// to age out. Cold members (deadline passed, loss sunk) fall back to LRS.
+	// When adaptive is on, the knee is controller-driven and this is the
+	// bootstrap/fallback value.
 	urgencySeconds time.Duration
+
+	// Self-balancing layer (strategy_groupturn_sb.go): when adaptive, the
+	// group size tracks the engine's running set and the warmth knee tracks
+	// the measured re-entry hit curve. Fairness is never adaptive.
+	adaptive bool
+	gMax     int
+	kneeMax  time.Duration
+	sb       *sbState
 
 	state sync.Map // program ID (string) -> *groupTurnState
 
@@ -252,6 +284,23 @@ type groupTurnStrategy struct {
 	pendingMu    sync.Mutex
 	pendingSum   float64
 	pendingCount int64
+}
+
+// effectiveGroupSize returns the current membership bound (controller-driven
+// when adaptive, the configured size otherwise).
+func (s *groupTurnStrategy) effectiveGroupSize() int {
+	if s.adaptive && s.sb != nil {
+		return s.sb.effectiveG()
+	}
+	return s.groupSize
+}
+
+// warmKnee returns the warmth-EDF knee in force right now.
+func (s *groupTurnStrategy) warmKnee() time.Duration {
+	if s.adaptive && s.sb != nil {
+		return s.sb.knee()
+	}
+	return s.urgencySeconds
 }
 
 const groupTurnDefaultMeanCost = 1000
@@ -290,6 +339,18 @@ type groupTurnWaiting struct {
 
 func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol.FlowQueueAccessor {
 	now := time.Now()
+
+	// Self-balancing controllers (slow clocks, own locks; fairness untouched).
+	if s.adaptive && s.sb != nil {
+		if s.sb.tickG(now) {
+			s.sb.stepG(s.sbRunningCount(), s.gMax, now)
+			groupTurnGroupTarget.Set(float64(s.sb.effectiveG()))
+		}
+		if s.sb.tickTau(now) {
+			s.sb.stepTau(s.kneeMax, now)
+			groupTurnKneeSeconds.Set(s.sb.knee().Seconds())
+		}
+	}
 
 	waiting := make([]groupTurnWaiting, 0, len(queues))
 	waitingIDs := make(map[string]bool, len(queues))
@@ -333,7 +394,7 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 	}
 
 	// 2. Fill vacant seats with waiting non-members, in entry-policy order.
-	for len(s.group) < s.groupSize {
+	for len(s.group) < s.effectiveGroupSize() {
 		cand := s.pickEntrantLocked(waiting, now)
 		if cand == "" {
 			break
@@ -452,7 +513,8 @@ func (s *groupTurnStrategy) pickLRSMemberLocked(waiting []groupTurnWaiting) stri
 	bestWarm, bestAny := "", ""
 	var bestWarmDispatch, bestAnyDispatch, bestWarmEnq, bestAnyEnq time.Time
 	now := time.Now()
-	useUrgency := s.urgencySeconds > 0
+	knee := s.warmKnee()
+	useUrgency := knee > 0
 	for _, w := range waiting {
 		if _, ok := s.group[w.id]; !ok {
 			continue
@@ -462,7 +524,7 @@ func (s *groupTurnStrategy) pickLRSMemberLocked(waiting []groupTurnWaiting) stri
 			(lastDispatch.Equal(bestAnyDispatch) && w.headEnq.Before(bestAnyEnq)) {
 			bestAny, bestAnyDispatch, bestAnyEnq = w.id, lastDispatch, w.headEnq
 		}
-		if useUrgency && now.Sub(lastDispatch) < s.urgencySeconds {
+		if useUrgency && now.Sub(lastDispatch) < knee {
 			if bestWarm == "" || lastDispatch.Before(bestWarmDispatch) ||
 				(lastDispatch.Equal(bestWarmDispatch) && w.headEnq.Before(bestWarmEnq)) {
 				bestWarm, bestWarmDispatch, bestWarmEnq = w.id, lastDispatch, w.headEnq
@@ -521,6 +583,9 @@ func (s *groupTurnStrategy) hasWaitingNonMemberLocked(waiting []groupTurnWaiting
 func (s *groupTurnStrategy) admitMemberLocked(id string, now time.Time) {
 	s.group[id] = struct{}{}
 	s.getOrCreateState(id).BeginStay(now)
+	if s.adaptive && s.sb != nil {
+		s.sb.noteAdmission()
+	}
 	groupTurnAdmissions.Inc()
 }
 
@@ -548,7 +613,10 @@ func (s *groupTurnStrategy) OnPreRequest(_ *ProgramMetrics, request *fwksched.In
 	if request == nil {
 		return
 	}
-	s.getOrCreateState(programIDFor(request)).RecordDispatch(time.Now())
+	now := time.Now()
+	st := s.getOrCreateState(programIDFor(request))
+	st.CapturePendingGap(now)
+	st.RecordDispatch(now)
 }
 
 func (s *groupTurnStrategy) OnCompleted(_ *ProgramMetrics, request *fwksched.InferenceRequest, response *fwkrc.Response) {
@@ -565,6 +633,11 @@ func (s *groupTurnStrategy) OnCompleted(_ *ProgramMetrics, request *fwksched.Inf
 	s.pendingSum += cost
 	s.pendingCount++
 	s.pendingMu.Unlock()
+	if s.adaptive && s.sb != nil {
+		if gap := st.takePendingGap(); gap > 0 && response.Usage.PromptTokenDetails != nil {
+			s.sb.feedReEntry(gap, float64(response.Usage.PromptTokenDetails.CachedTokens), float64(response.Usage.PromptTokens), now)
+		}
+	}
 	groupTurnServiceTokens.WithLabelValues(id).Set(st.Service(now, s.halfLifeSeconds))
 }
 

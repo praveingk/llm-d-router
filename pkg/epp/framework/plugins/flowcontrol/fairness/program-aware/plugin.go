@@ -59,6 +59,10 @@ type Config struct {
 	GroupTurnHoldSeconds     float64 `json:"groupTurnHoldSeconds,omitempty"`
 	GroupTurnHalfLifeSeconds float64 `json:"groupTurnHalfLifeSeconds,omitempty"`
 	GroupTurnUrgencySeconds  float64 `json:"groupTurnUrgencySeconds,omitempty"`
+
+	GroupTurnAdaptive         bool    `json:"groupTurnAdaptive,omitempty"`
+	GroupTurnAdaptiveGMax     int     `json:"groupTurnAdaptiveGMax,omitempty"`
+	GroupTurnKneeMaxSeconds   float64 `json:"groupTurnKneeMaxSeconds,omitempty"`
 }
 
 func DefaultConfig() Config {
@@ -81,6 +85,10 @@ func DefaultConfig() Config {
 		GroupTurnHoldSeconds:     120,
 		GroupTurnHalfLifeSeconds: 60,
 		GroupTurnUrgencySeconds:  0,
+
+		GroupTurnAdaptive:       false,
+		GroupTurnAdaptiveGMax:   256,
+		GroupTurnKneeMaxSeconds: 120,
 	}
 }
 
@@ -135,6 +143,14 @@ func (c Config) validate() error {
 	}
 	if c.GroupTurnUrgencySeconds < 0 {
 		return fmt.Errorf("groupTurnUrgencySeconds must be >= 0, got %v", c.GroupTurnUrgencySeconds)
+	}
+	if c.GroupTurnAdaptive {
+		if c.GroupTurnAdaptiveGMax < 16 {
+			return fmt.Errorf("groupTurnAdaptiveGMax must be >= 16 when adaptive, got %v", c.GroupTurnAdaptiveGMax)
+		}
+		if c.GroupTurnKneeMaxSeconds < 30 || c.GroupTurnKneeMaxSeconds > 300 {
+			return fmt.Errorf("groupTurnKneeMaxSeconds must be in [30, 300], got %v", c.GroupTurnKneeMaxSeconds)
+		}
 	}
 	return nil
 }

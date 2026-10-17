@@ -17,6 +17,7 @@ limitations under the License.
 package programaware
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -463,4 +464,160 @@ func TestGroupTurn_WarmthEDF_NeverDispatchedIsCold(t *testing.T) {
 	got := s.Pick(0, queues)
 	require.NotNil(t, got)
 	assert.Equal(t, "beta", got.FlowKey().ID, "warm member beats the never-dispatched newcomer (no prefix to save)")
+}
+
+func newAdaptive(gMax int) *groupTurnStrategy {
+	s := newGroupTurn(4, 100)
+	s.adaptive = true
+	s.gMax = gMax
+	s.kneeMax = 120 * time.Second
+	s.sb = newSBState(gMax, s.kneeMax)
+	return s
+}
+
+func TestSB_G_ShrinksSlowlyIntoBandThenGrows(t *testing.T) {
+	sb := newSBState(256, 120*time.Second)
+	assert.Equal(t, 256, sb.currentG, "G0 = max_num_seqs (non-porous by construction)")
+
+	// 40 minutes at running≈150 (jittered like a real gauge — a perfectly flat
+	// reading is a dead sensor and freezes G by design): EWMA converges ~150;
+	// shrink is triple-gated (k=3, age >= 15 min, cold admissions) and
+	// bounded at -8/update.
+	now := time.Now()
+	prev := 256
+	for i := 1; i <= 40; i++ {
+		sb.stepG(int64(150+i%3-1), 256, now.Add(time.Duration(i)*time.Minute))
+		g := sb.effectiveG()
+		assert.LessOrEqual(t, prev-g, 8, "shrink is non-refill, at most 8 per update")
+		assert.GreaterOrEqual(t, g, 16)
+		prev = g
+	}
+	g := sb.effectiveG()
+	rBar := sb.runningEWMA
+	assert.InDelta(t, 150, rBar, 5)
+	assert.GreaterOrEqual(t, float64(g), 1.15*rBar, "never below the band floor")
+	assert.LessOrEqual(t, float64(g), 1.45*rBar+8, "reaches the band")
+
+	// Running set jumps to 240: grow is immediate, +32 capped, bounded by gMax.
+	for i := 1; i <= 6; i++ {
+		sb.stepG(int64(240+i%3-1), 256, now.Add(time.Duration(40+i)*time.Minute))
+	}
+	assert.Equal(t, 256, sb.effectiveG(), "grows back to the cap")
+}
+
+func TestSB_G_ShortLullDoesNotShrink(t *testing.T) {
+	sb := newSBState(256, 120*time.Second)
+	now := time.Now()
+	// Converge with running≈150 (jittered like a real gauge) for 30 min: G
+	// settles in the band with the shrink streak reset.
+	for i := 1; i <= 30; i++ {
+		sb.stepG(int64(150+i%3-1), 256, now.Add(time.Duration(i)*time.Minute))
+	}
+	gBefore := sb.effectiveG()
+	// A single 60s lull poll at r=80: the asymmetric (slow-down) filter keeps
+	// rbar high enough that the shrink streak (k=3) cannot complete in one
+	// poll — G must not shrink.
+	sb.stepG(80, 256, now.Add(31*time.Minute))
+	assert.Equal(t, gBefore, sb.effectiveG(), "one lull poll must not shrink G")
+	// A second lull poll: streak is 2 of 3 — still no shrink.
+	sb.stepG(80, 256, now.Add(32*time.Minute))
+	assert.Equal(t, gBefore, sb.effectiveG(), "two lull polls must not shrink G (k=3 guard)")
+}
+
+func TestSB_Tau_ColdThenWarmFlipClamped(t *testing.T) {
+	sb := newSBState(256, 120*time.Second)
+	base := time.Now()
+
+	feed := func(bin0, bin1, bin2 int) {
+		// bin ratios: plateau 0.90; cold: 30-60s warm-ish, 60-120s cold.
+		for i := 0; i < bin0; i++ {
+			sb.feedReEntry(10*time.Second, 90, 100, base.Add(time.Duration(i)*500*time.Millisecond))
+		}
+		for i := 0; i < bin1; i++ {
+			sb.feedReEntry(45*time.Second, 85, 100, base.Add(time.Duration(i)*500*time.Millisecond))
+		}
+		for i := 0; i < bin2; i++ {
+			sb.feedReEntry(90*time.Second, 35, 100, base.Add(time.Duration(i)*500*time.Millisecond))
+		}
+	}
+	// Cold well: 60-120s re-entries miss; bins valid (>=25 samples each);
+	// the knee reads the 60s edge (bin 1 upper edge).
+	feed(30, 30, 30)
+	sb.stepTau(120*time.Second, base.Add(30*time.Second))
+	assert.Equal(t, 60*time.Second, sb.knee(), "cold well: knee at the 60s edge")
+
+	// Warm flip over a realistic ~10-minute window (the bin EWMA T_f = 600 s
+	// needs the new regime to outvote the old — the sim saw the latch at
+	// minute ~20): 60-120s re-entries now hit; the latch jumps the knee to
+	// 120s (also the deployment clamp).
+	base2 := base.Add(time.Minute)
+	for i := 0; i < 60; i++ {
+		t := base2.Add(time.Duration(i) * 10 * time.Second)
+		sb.feedReEntry(10*time.Second, 90, 100, t)
+		sb.feedReEntry(90*time.Second, 85, 100, t)
+	}
+	sb.stepTau(120*time.Second, base2.Add(11*time.Minute))
+	sb.stepTau(120*time.Second, base2.Add(13*time.Minute))
+	k := sb.knee()
+	assert.Equal(t, 120*time.Second, k, "warm flip latches the knee to 120s (clamped at kneeMax)")
+}
+
+func TestSB_Tau_StarvedHolds(t *testing.T) {
+	sb := newSBState(256, 120*time.Second)
+	base := time.Now()
+	for i := 0; i < 40; i++ { // enough to be valid once
+		sb.feedReEntry(10*time.Second, 90, 100, base.Add(time.Duration(i)*500*time.Millisecond))
+	}
+	sb.stepTau(120*time.Second, base.Add(30*time.Second))
+	before := sb.knee()
+	// 30 minutes of starvation: the decayed sample count falls below the
+	// validity gate and the knee must hold.
+	late := base.Add(30 * time.Minute)
+	sb.stepTau(120*time.Second, late)
+	assert.Equal(t, before, sb.knee(), "starved estimator holds the prior knee")
+}
+
+func TestSB_AdaptivePickUsesControllerG(t *testing.T) {
+	s := newAdaptive(8)
+	now := time.Now()
+	queues := map[string]QueueInfo{}
+	for i := 0; i < 6; i++ {
+		id, q := makeInfo(fmt.Sprintf("s%d", i), now.Add(-time.Duration(i)*time.Second))
+		queues[id] = q
+	}
+	got := s.Pick(0, queues)
+	require.NotNil(t, got)
+	// G0 = 8 > 6 waiting: everyone is a member.
+	for i := 0; i < 6; i++ {
+		assert.True(t, s.isMember(fmt.Sprintf("s%d", i)))
+	}
+	// The warmth knee is the controller's bootstrap (60s).
+	assert.Equal(t, 60*time.Second, s.warmKnee())
+}
+
+func TestSB_ConfigValidation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Strategy = groupTurnStrategyName
+	cfg.GroupTurnAdaptive = true
+	cfg.GroupTurnAdaptiveGMax = 8
+	assert.Error(t, cfg.validate())
+
+	cfg = DefaultConfig()
+	cfg.Strategy = groupTurnStrategyName
+	cfg.GroupTurnAdaptive = true
+	cfg.GroupTurnKneeMaxSeconds = 10
+	assert.Error(t, cfg.validate())
+
+	cfg = DefaultConfig()
+	cfg.Strategy = groupTurnStrategyName
+	cfg.GroupTurnAdaptive = true
+	require.NoError(t, cfg.validate())
+	st, err := newStrategy(cfg)
+	require.NoError(t, err)
+	gt, ok := st.(*groupTurnStrategy)
+	require.True(t, ok)
+	assert.True(t, gt.adaptive)
+	assert.NotNil(t, gt.sb)
+	assert.Equal(t, 256, gt.gMax)
+	assert.Equal(t, 120*time.Second, gt.kneeMax)
 }

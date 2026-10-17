@@ -58,7 +58,7 @@ func newStrategy(cfg Config) (Strategy, error) {
 			inactivitySeconds: cfg.TurnPriorityInactivitySeconds,
 		}, nil
 	case groupTurnStrategyName:
-		return &groupTurnStrategy{
+		gt := &groupTurnStrategy{
 			groupSize:       cfg.GroupTurnSize,
 			turnQuota:       cfg.GroupTurnQuota,
 			entryPolicy:     cfg.GroupTurnEntryPolicy,
@@ -67,7 +67,14 @@ func newStrategy(cfg Config) (Strategy, error) {
 			holdDuration:    time.Duration(cfg.GroupTurnHoldSeconds * float64(time.Second)),
 			halfLifeSeconds: cfg.GroupTurnHalfLifeSeconds,
 			urgencySeconds:  time.Duration(cfg.GroupTurnUrgencySeconds * float64(time.Second)),
-		}, nil
+			adaptive:        cfg.GroupTurnAdaptive,
+			gMax:            cfg.GroupTurnAdaptiveGMax,
+			kneeMax:         time.Duration(cfg.GroupTurnKneeMaxSeconds * float64(time.Second)),
+		}
+		if gt.adaptive {
+			gt.sb = newSBState(gt.gMax, gt.kneeMax)
+		}
+		return gt, nil
 	default:
 		return nil, fmt.Errorf("unknown scoring strategy %q: only \"las\", \"turn-priority\" and \"group-turn\" are supported", cfg.Strategy)
 	}
