@@ -272,6 +272,41 @@ func TestGroupTurnCold_QuotaSwapSkipsUnaffordableEntrant(t *testing.T) {
 	assert.True(t, deferred, "unaffordable entrant deferred during the swap pre-screen")
 }
 
+func TestGroupTurnCold_AllDeferredFallbackIsIdleNotPanic(t *testing.T) {
+	// Live crash (exp7 t5, 2026-10-18): the group is full of members with no
+	// waiting work; every waiting head is a non-member whose cold charge is
+	// unaffordable. selectCandidateLocked's step-4 pre-screen
+	// (pickAffordableEntrantLocked) defers each head while scanning entrants,
+	// so the defensive fallback's re-filter of `selectable` came back EMPTY —
+	// and oldestWaitingID indexed [0] of a zero-length slice, crashing the
+	// EPP's dispatch loop (panic every few minutes under c256 load). The
+	// fallback must return "" (the caller's idle-pick path), never panic.
+	s := newColdGroupTurn(1, 100, 100, 2, chargeByFairnessID(nil))
+	now := time.Now()
+
+	// Seat and idle the lone member: the group is then full of non-waiting
+	// members (step 2 finds no vacancy, step 3 no waiting member), which is
+	// the deep-phase steady state that produced the live crash.
+	idA, qA := makeInfoReq("alpha", now)
+	require.NotNil(t, s.Pick(0, map[string]QueueInfo{idA: qA}))
+	gtDispatch(s, "alpha")
+	gtComplete(s, "alpha", 10, 5)
+
+	// Two outsiders with oversized cold charges and drained buckets: the
+	// entrant pre-screen defers both while scanning.
+	idB, qB := makeInfoReq("bravo", now.Add(-time.Second))
+	idC, qC := makeInfoReq("charlie", now.Add(-2*time.Second))
+	s.coldCharge = chargeByFairnessID(map[string]float64{"bravo": 5000, "charlie": 5000})
+	drainColdBucket(s, "bravo", 100, now)
+	drainColdBucket(s, "charlie", 100, now)
+
+	got := s.Pick(0, map[string]QueueInfo{idB: qB, idC: qC})
+	assert.Nil(t, got, "every head deferred by the pre-screen: idle pick (nil), not a panic")
+	_, defB := s.coldDeferUntil["bravo"]
+	_, defC := s.coldDeferUntil["charlie"]
+	assert.True(t, defB && defC, "both outsider heads were deferred during entrant pre-screening")
+}
+
 func TestGroupTurnCold_ChargePathWithStub(t *testing.T) {
 	// Affordable predicted cold: charged at the dispatch decision.
 	s := newColdGroupTurn(4, 100, 2000, 2, chargeByFairnessID(map[string]float64{"alpha": 1234}))

@@ -500,8 +500,16 @@ func (s *groupTurnStrategy) selectCandidateLocked(all, selectable []groupTurnWai
 	if candID == "" {
 		// Defensive: waiting flows exist but none admissible and no member
 		// waiting. Fall back to the oldest eligible head so dispatch never
-		// stalls.
-		return oldestWaitingID(s.coldSelectableLocked(selectable, now))
+		// stalls. The step-4 pre-screen (pickAffordableEntrantLocked) defers
+		// unaffordable entrants in place, so by the time we get here every
+		// head in `selectable` may be deferred and the re-filter empty: that
+		// is an idle pick (the caller handles ""), never an index out of
+		// range (live crash: exp7 t5, 2026-10-18 — oldestWaitingID[0] on a
+		// zero-length slice killed the EPP's dispatch loop).
+		if eligible := s.coldSelectableLocked(selectable, now); len(eligible) > 0 {
+			return oldestWaitingID(eligible)
+		}
+		return ""
 	}
 
 	// 5. Turn quota: rotate the exhausted member out for the entry-queue head
