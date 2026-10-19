@@ -55,17 +55,18 @@ func TestFactory_UnknownStrategy(t *testing.T) {
 }
 
 // TestFactory_GroupTurnMinimalV3Config pins the v3 minimal config surface:
-// strategy: group-turn alone is complete — the sentinel group (4096), the
-// fixed knee (tau = 120 s) and the max-wait bound (D = 600 s) are the
-// defaults, so groupTurnUrgencySeconds/groupTurnMaxWaitSeconds are optional
-// overrides, not required settings.
+// strategy: group-turn alone is complete — the structurally unbounded group
+// (size 0: no admission gate, no quota swap, no victim eviction), the fixed
+// knee (tau = 120 s) and the max-wait bound (D = 600 s) are the defaults, so
+// groupTurnUrgencySeconds/groupTurnMaxWaitSeconds are optional overrides,
+// not required settings.
 func TestFactory_GroupTurnMinimalV3Config(t *testing.T) {
 	p, err := ProgramAwarePluginFactory("test", decoder(`{"strategy":"group-turn"}`), nil)
 	require.NoError(t, err)
 	require.NotNil(t, p)
 	gt, ok := p.(*ProgramAwarePlugin).strategy.(*groupTurnStrategy)
 	require.True(t, ok)
-	assert.Equal(t, 4096, gt.groupSize)
+	assert.Equal(t, 0, gt.groupSize, "size 0 = structurally unbounded (the default)")
 	assert.Equal(t, 120*time.Second, gt.warmKnee())
 	assert.Equal(t, 600*time.Second, gt.maxWait)
 	assert.False(t, gt.adaptive)

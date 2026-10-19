@@ -96,6 +96,15 @@ var (
 			Help:      metricsutil.HelpMsgWithStability("Members that left the group after exceeding the hold time.", compbasemetrics.ALPHA),
 		})
 
+	// Label-free by design, matching the other group-turn counters: a
+	// per-program label would be user-controlled cardinality (p14 §9.8).
+	groupTurnMaxWaitPicks = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "program_aware_group_turn_max_wait_picks_total",
+			Help:      metricsutil.HelpMsgWithStability("Waiting sessions served via the max-wait bound (D), preempting warmth-EDF.", compbasemetrics.ALPHA),
+		})
+
 	groupTurnServiceTokens = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
@@ -263,8 +272,9 @@ func (st *groupTurnState) snapshot() (dispatchedTotal, stayStart, inFlight int64
 
 var _ Strategy = &groupTurnStrategy{}
 
-// groupTurnStrategy schedules turns, not requests. A bounded group of programs
-// holds dispatch priority — the KV-warm resident set — and membership rotates:
+// groupTurnStrategy schedules turns, not requests. A group of programs
+// holds dispatch priority — the KV-warm resident set — and membership
+// rotates (unbounded by default, bounded for experiments):
 //
 //   - Pick dispatches the least-recently-served member with a waiting request.
 //   - A member that has dispatched its turn quota (turnQuota requests since its
@@ -287,6 +297,8 @@ var _ Strategy = &groupTurnStrategy{}
 //     one more warm refresh (p14 §2: the tail past a few minutes is nearly
 //     free to cut).
 type groupTurnStrategy struct {
+	// groupSize bounds membership for bounded-group experiments. <= 0 (the
+	// default) is structurally unbounded: see effectiveGroupSize.
 	groupSize       int
 	turnQuota       int64
 	entryPolicy     string
@@ -363,10 +375,20 @@ func (s *groupTurnStrategy) waitingOutsideCount(queues map[string]QueueInfo) int
 }
 
 // effectiveGroupSize returns the current membership bound (controller-driven
-// when adaptive, the configured size otherwise).
+// when adaptive, the configured size otherwise). A configured size <= 0
+// means unbounded — treated as infinite at the one place the bound is
+// checked (the seat-fill loop), which admits every waiting session and so
+// structurally disables the group machinery rather than special-casing
+// each site: with no non-members, the quota swap never fires (an exhausted
+// member renews its stay), and the all-idle victim path never triggers (a
+// member is always waiting) (p15 §3: a large sentinel was rejected because
+// it re-binds the machinery with wrong semantics once exceeded).
 func (s *groupTurnStrategy) effectiveGroupSize() int {
 	if s.adaptive && s.sb != nil {
 		return s.sb.effectiveG()
+	}
+	if s.groupSize <= 0 {
+		return math.MaxInt
 	}
 	return s.groupSize
 }
@@ -679,6 +701,12 @@ func (s *groupTurnStrategy) pickMaxWaitLocked(waiting []groupTurnWaiting, now ti
 			best, bestEnq = w.id, w.headEnq
 		}
 	}
+	if best != "" {
+		// Count only actual D-lane picks, not every check: this is the
+		// live run's D-fire rate (the falsification target is "rare at
+		// <=1x load, present at overload").
+		groupTurnMaxWaitPicks.Inc()
+	}
 	return best
 }
 
@@ -858,6 +886,7 @@ func (s *groupTurnStrategy) Collectors() []prometheus.Collector {
 		groupTurnSwaps,
 		groupTurnVictimEvictions,
 		groupTurnHoldExits,
+		groupTurnMaxWaitPicks,
 		groupTurnServiceTokens,
 		// Self-balancing controller gauges (defined in
 		// strategy_groupturn_sb.go; previously never registered, so they

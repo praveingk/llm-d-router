@@ -81,18 +81,23 @@ func DefaultConfig() Config {
 		TurnPriorityTimeWeight:        0.05,
 		TurnPriorityInactivitySeconds: 120,
 
-		GroupTurnSize:            4096,
+		GroupTurnSize:            0,
 		GroupTurnQuota:           4,
 		GroupTurnEntryPolicy:     groupTurnEntryLeastService,
 		GroupTurnVictimPolicy:    groupTurnVictimLongestIdle,
 		GroupTurnCreditPolicy:    groupTurnCreditKeep,
 		GroupTurnHoldSeconds:     120,
 		GroupTurnHalfLifeSeconds: 60,
-		// v3 defaults (p13/p14 direction): the group is a sentinel — G is no
-		// longer a meaningful knob (membership never binds; every waiting
-		// session is a member), still settable for experiments. The knee is a
-		// fixed tau (warmth-EDF on at 120 s) rather than controller-driven:
-		// adaptive stays off. D is the hard max-wait SLO.
+		// v3 defaults (p13–p15 direction): the group is structurally unbounded
+		// (groupTurnSize 0) — G is no longer a meaningful knob. A sentinel was
+		// rejected (p15 §3): at >4096 tracked sessions it would re-bind the
+		// group machinery with wrong semantics (quota swaps re-engage at the
+		// default quota). A positive size still bounds the group for
+		// experiments. The knee is a fixed tau (warmth-EDF on at 120 s)
+		// rather than controller-driven: adaptive stays off. D is the hard
+		// max-wait SLO and has no disabled state (0 is refused) — a silent
+		// D=0 misconfiguration would ship the c512 tail; ablate with a huge
+		// bound (e.g. 86400) instead.
 		GroupTurnUrgencySeconds: 120,
 		GroupTurnMaxWaitSeconds: 600,
 
@@ -127,8 +132,8 @@ func (c Config) validate() error {
 	if c.TurnPriorityInactivitySeconds < 0 {
 		return fmt.Errorf("turnPriorityInactivitySeconds must be >= 0, got %v", c.TurnPriorityInactivitySeconds)
 	}
-	if c.GroupTurnSize < 1 {
-		return fmt.Errorf("groupTurnSize must be >= 1, got %v", c.GroupTurnSize)
+	if c.GroupTurnSize < 0 {
+		return fmt.Errorf("groupTurnSize must be >= 0 (0 = unbounded, the default), got %v", c.GroupTurnSize)
 	}
 	if c.GroupTurnQuota < 1 {
 		return fmt.Errorf("groupTurnQuota must be >= 1, got %v", c.GroupTurnQuota)

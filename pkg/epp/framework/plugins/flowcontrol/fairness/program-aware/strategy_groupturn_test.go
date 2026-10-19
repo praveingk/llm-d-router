@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -357,11 +358,13 @@ func TestNewStrategy_GroupTurnWiring(t *testing.T) {
 	require.NoError(t, err)
 	gt, ok := st.(*groupTurnStrategy)
 	require.True(t, ok)
-	// v3 defaults (p13/p14): the group is a sentinel (4096, no longer a
-	// meaningful knob) and warmth-EDF is on at a fixed tau of 120 s
-	// non-adaptively (urgency 0 used to mean EDF disabled; 120 now enables
-	// it). D bounds the max wait at 600 s.
-	assert.Equal(t, 4096, gt.groupSize)
+	// v3 defaults (p13–p15): the group is structurally unbounded (size 0 —
+	// no admission gate, no quota swap, no victim eviction; a positive size
+	// still bounds it for experiments) and warmth-EDF is on at a fixed tau
+	// of 120 s non-adaptively (urgency 0 used to mean EDF disabled; 120 now
+	// enables it). D bounds the max wait at 600 s.
+	assert.Equal(t, 0, gt.groupSize)
+	assert.Equal(t, math.MaxInt, gt.effectiveGroupSize(), "size 0 is structurally unbounded, not a sentinel")
 	assert.Equal(t, int64(4), gt.turnQuota)
 	assert.Equal(t, groupTurnEntryLeastService, gt.entryPolicy)
 	assert.Equal(t, groupTurnVictimLongestIdle, gt.victimPolicy)
@@ -376,8 +379,14 @@ func TestNewStrategy_GroupTurnWiring(t *testing.T) {
 func TestGroupTurn_ConfigValidation(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Strategy = groupTurnStrategyName
-	cfg.GroupTurnSize = 0
+	// v3: 0 is the unbounded default; negative sizes are refused.
+	cfg.GroupTurnSize = -1
 	assert.Error(t, cfg.validate())
+
+	cfg = DefaultConfig()
+	cfg.Strategy = groupTurnStrategyName
+	cfg.GroupTurnSize = 0
+	require.NoError(t, cfg.validate(), "0 = unbounded, the default")
 
 	cfg = DefaultConfig()
 	cfg.Strategy = groupTurnStrategyName
@@ -606,6 +615,71 @@ func TestGroupTurn_MaxWait_BoundaryIsInclusive(t *testing.T) {
 
 	w = []groupTurnWaiting{{id: "alpha", headEnq: now.Add(-600*time.Second - time.Millisecond)}}
 	assert.Equal(t, "alpha", s.pickMaxWaitLocked(w, now), "wait just past D is expired")
+}
+
+// TestGroupTurn_UnboundedGroup_NoAdmissionGateOrSwap pins the structural
+// unbounded semantics (p15 §3): with size <= 0 every waiting session is
+// admitted, so there are no non-members — which means the quota swap never
+// fires (an exhausted member renews its stay) and, by the same structural
+// argument, the all-idle victim path never triggers (a member is always
+// waiting). A bounded group (positive size) keeps the old machinery.
+func TestGroupTurn_UnboundedGroup_NoAdmissionGateOrSwap(t *testing.T) {
+	s := newGroupTurn(0, 1) // unbounded (the v3 default), quota 1
+	now := time.Now()
+
+	queues := map[string]QueueInfo{}
+	for i := 0; i < 6; i++ {
+		id, q := makeInfo(fmt.Sprintf("s%d", i), now.Add(-time.Duration(i)*time.Second))
+		queues[id] = q
+	}
+	require.NotNil(t, s.Pick(0, queues))
+	for i := 0; i < 6; i++ {
+		assert.True(t, s.isMember(fmt.Sprintf("s%d", i)), "unbounded: every waiting session is admitted")
+	}
+
+	// Quota exhaustion cannot swap anyone out: no waiting non-member exists,
+	// so the exhausted member renews its stay and keeps both the seat and
+	// the next dispatch.
+	gtDispatch(s, "s0") // quota of 1 exhausted
+	got := s.Pick(0, map[string]QueueInfo{"s0": queues["s0"]})
+	require.NotNil(t, got)
+	assert.Equal(t, "s0", got.FlowKey().ID)
+	assert.True(t, s.isMember("s0"), "quota swap needs a waiting outsider; under unbounded there are none")
+}
+
+// TestGroupTurn_MaxWaitPickCounter pins the D-lane counter: it increments
+// only when the max-wait bound actually moves a session to the front of the
+// pick, not on every check and not on a plain warmth-EDF pick. This is the
+// live run's D-fire rate (the falsification target).
+func TestGroupTurn_MaxWaitPickCounter(t *testing.T) {
+	before := promtestutil.ToFloat64(groupTurnMaxWaitPicks)
+
+	s := newGroupTurn(4, 100)
+	s.urgencySeconds = 60 * time.Second
+	s.maxWait = 600 * time.Second
+	now := time.Now()
+
+	idA, qA := makeInfo("alpha", now.Add(-1*time.Second))
+	queues := map[string]QueueInfo{idA: qA}
+	require.NotNil(t, s.Pick(0, queues)) // alpha admitted
+	gtDispatch(s, "alpha")
+	stA := s.getOrCreateState("alpha")
+	stA.mu.Lock()
+	stA.lastDispatch = now.Add(-10 * time.Second) // warm: the EDF favorite
+	stA.mu.Unlock()
+
+	// A warmth-EDF pick leaves the counter untouched.
+	got := s.Pick(0, queues)
+	require.NotNil(t, got)
+	assert.Equal(t, "alpha", got.FlowKey().ID)
+	assert.Equal(t, before, promtestutil.ToFloat64(groupTurnMaxWaitPicks), "warm-EDF pick does not touch the D-lane counter")
+
+	// A D-lane pick increments it exactly once.
+	_, qB := makeInfo("beta", now.Add(-700*time.Second))
+	got = s.Pick(0, map[string]QueueInfo{idA: qA, "beta": qB})
+	require.NotNil(t, got)
+	assert.Equal(t, "beta", got.FlowKey().ID)
+	assert.Equal(t, before+1, promtestutil.ToFloat64(groupTurnMaxWaitPicks), "D-lane pick increments the counter")
 }
 
 // TestGroupTurn_OnAborted_ReleasesSeatWithoutCharging pins the abort
