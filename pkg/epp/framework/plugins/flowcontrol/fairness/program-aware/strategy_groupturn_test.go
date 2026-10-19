@@ -18,6 +18,7 @@ package programaware
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -183,7 +184,7 @@ func TestGroupTurn_EntryLeastService(t *testing.T) {
 	gtComplete(s, "alpha", 10, 5) // alpha idle; group full
 
 	// beta is heavy, gamma is light: least-service entry picks gamma.
-	s.getOrCreateState("beta").AddService(1000)
+	s.getOrCreateState("beta").AddService(1000, time.Now(), s.halfLifeSeconds)
 	idB, qB := makeInfo("beta", now.Add(-10*time.Second))
 	idC, qC := makeInfo("gamma", now)
 	queues2 := map[string]QueueInfo{idB: qB, idC: qC}
@@ -204,7 +205,7 @@ func TestGroupTurn_EntryOldestWait(t *testing.T) {
 	gtDispatch(s, "alpha")
 	gtComplete(s, "alpha", 10, 5)
 
-	s.getOrCreateState("gamma").AddService(1000) // heavy but oldest head
+	s.getOrCreateState("gamma").AddService(1000, time.Now(), s.halfLifeSeconds) // heavy but oldest head
 	idB, qB := makeInfo("beta", now.Add(-1*time.Second))
 	idC, qC := makeInfo("gamma", now.Add(-30*time.Second))
 	queues2 := map[string]QueueInfo{idB: qB, idC: qC}
@@ -224,7 +225,7 @@ func TestGroupTurn_CreditResetZeroesService(t *testing.T) {
 	queues := map[string]QueueInfo{idA: qA, idB: qB}
 
 	require.NotNil(t, s.Pick(0, queues))
-	s.getOrCreateState("alpha").AddService(500)
+	s.getOrCreateState("alpha").AddService(500, time.Now(), s.halfLifeSeconds)
 	gtDispatch(s, "alpha") // quota of 1 exhausted
 
 	got := s.Pick(0, queues)
@@ -242,7 +243,7 @@ func TestGroupTurn_CreditKeepRetainsService(t *testing.T) {
 	queues := map[string]QueueInfo{idA: qA, idB: qB}
 
 	require.NotNil(t, s.Pick(0, queues))
-	s.getOrCreateState("alpha").AddService(500)
+	s.getOrCreateState("alpha").AddService(500, time.Now(), s.halfLifeSeconds)
 	gtDispatch(s, "alpha")
 
 	got := s.Pick(0, queues)
@@ -265,8 +266,8 @@ func TestGroupTurn_VictimLeastServiceArm(t *testing.T) {
 	gtDispatch(s, "beta")
 	gtComplete(s, "beta", 10, 5)
 
-	s.getOrCreateState("alpha").AddService(1000) // heavy
-	s.getOrCreateState("beta").AddService(10)    // light -> victim under least-service
+	s.getOrCreateState("alpha").AddService(1000, time.Now(), s.halfLifeSeconds) // heavy
+	s.getOrCreateState("beta").AddService(10, time.Now(), s.halfLifeSeconds)    // light -> victim under least-service
 
 	idC, qC := makeInfo("gamma", now)
 	queues2 := map[string]QueueInfo{idC: qC}
@@ -356,13 +357,20 @@ func TestNewStrategy_GroupTurnWiring(t *testing.T) {
 	require.NoError(t, err)
 	gt, ok := st.(*groupTurnStrategy)
 	require.True(t, ok)
-	assert.Equal(t, 32, gt.groupSize)
+	// v3 defaults (p13/p14): the group is a sentinel (4096, no longer a
+	// meaningful knob) and warmth-EDF is on at a fixed tau of 120 s
+	// non-adaptively (urgency 0 used to mean EDF disabled; 120 now enables
+	// it). D bounds the max wait at 600 s.
+	assert.Equal(t, 4096, gt.groupSize)
 	assert.Equal(t, int64(4), gt.turnQuota)
 	assert.Equal(t, groupTurnEntryLeastService, gt.entryPolicy)
 	assert.Equal(t, groupTurnVictimLongestIdle, gt.victimPolicy)
 	assert.Equal(t, groupTurnCreditKeep, gt.creditPolicy)
 	assert.Equal(t, 120*time.Second, gt.holdDuration)
 	assert.Equal(t, 60.0, gt.halfLifeSeconds)
+	assert.Equal(t, 120*time.Second, gt.warmKnee(), "fixed knee tau=120, non-adaptive")
+	assert.Equal(t, 600*time.Second, gt.maxWait)
+	assert.False(t, gt.adaptive)
 }
 
 func TestGroupTurn_ConfigValidation(t *testing.T) {
@@ -390,6 +398,21 @@ func TestGroupTurn_ConfigValidation(t *testing.T) {
 	cfg.Strategy = groupTurnStrategyName
 	cfg.GroupTurnCreditPolicy = "bogus"
 	assert.Error(t, cfg.validate())
+}
+
+func TestGroupTurn_MaxWaitConfigValidation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Strategy = groupTurnStrategyName
+	cfg.GroupTurnMaxWaitSeconds = 0
+	err := cfg.validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "groupTurnMaxWaitSeconds", "explicit zero refused: D has no disabled state")
+
+	cfg.GroupTurnMaxWaitSeconds = -1
+	require.Error(t, cfg.validate())
+
+	cfg.GroupTurnMaxWaitSeconds = 300
+	require.NoError(t, cfg.validate())
 }
 
 func TestGroupTurn_WarmthEDF_SavesExpiringWarmMember(t *testing.T) {
@@ -464,6 +487,188 @@ func TestGroupTurn_WarmthEDF_NeverDispatchedIsCold(t *testing.T) {
 	got := s.Pick(0, queues)
 	require.NotNil(t, got)
 	assert.Equal(t, "beta", got.FlowKey().ID, "warm member beats the never-dispatched newcomer (no prefix to save)")
+}
+
+// TestGroupTurn_AddService_AppliesPendingDecayFirst pins the decay-then-add
+// arithmetic (p14 §3e): the service accrued so far must decay up to the
+// charge instant before the new cost lands, exactly as LAS does. The
+// pre-v3 code charged without decaying, so a member's service never decayed
+// between its own completions and it re-entered the entry contest several
+// half-lives heavier than its true decayed service.
+func TestGroupTurn_AddService_AppliesPendingDecayFirst(t *testing.T) {
+	now := time.Now()
+
+	// No time elapsed: charges simply sum.
+	st := &groupTurnState{}
+	st.AddService(1000, now, 60)
+	st.AddService(1000, now, 60)
+	assert.Equal(t, 2000.0, st.service)
+
+	// One half-life between charges: the first 1000 halves before the second
+	// lands.
+	st = &groupTurnState{}
+	st.AddService(1000, now, 60)
+	st.AddService(1000, now.Add(60*time.Second), 60)
+	assert.Equal(t, 1500.0, st.service)
+
+	// The p14 probe case: ten half-lives (600 s at half-life 60) between two
+	// charges of 1000 — the frozen-currency bug read 2000 where LAS semantics
+	// give 1000*2^-10 + 1000.
+	st = &groupTurnState{}
+	st.AddService(1000, now, 60)
+	st.AddService(1000, now.Add(600*time.Second), 60)
+	assert.InDelta(t, 1000*math.Pow(0.5, 10)+1000, st.service, 1e-9)
+
+	// The anchor advances with each charge, so a later read decays only from
+	// the last charge (one more half-life past it: 1500 -> 750).
+	st = &groupTurnState{}
+	st.AddService(1000, now, 60)
+	st.AddService(1000, now.Add(60*time.Second), 60)
+	assert.Equal(t, 750.0, st.Service(now.Add(120*time.Second), 60))
+}
+
+// TestGroupTurn_MaxWait_PreemptsWarmthEDF pins that the hard max-wait bound D
+// outranks the warmth-EDF pick: an expired head is served even while a warm
+// member is the EDF favorite. The control run (D disabled) pins the opposite,
+// so the test fails if the bound silently stops preempting.
+func TestGroupTurn_MaxWait_PreemptsWarmthEDF(t *testing.T) {
+	setup := func(maxWait time.Duration) string {
+		s := newGroupTurn(4, 100)
+		s.urgencySeconds = 60 * time.Second
+		s.maxWait = maxWait
+		now := time.Now()
+
+		idA, qA := makeInfo("alpha", now.Add(-1*time.Second))
+		idB, qB := makeInfo("beta", now.Add(-1*time.Second))
+		queues := map[string]QueueInfo{idA: qA, idB: qB}
+		require.NotNil(t, s.Pick(0, queues)) // both admitted
+
+		// alpha dispatched 10 s ago: warm, the EDF favorite. beta dispatched
+		// 5 minutes ago: cold — but beta's head has waited past D.
+		gtDispatch(s, "alpha")
+		stA := s.getOrCreateState("alpha")
+		stA.mu.Lock()
+		stA.lastDispatch = now.Add(-10 * time.Second)
+		stA.mu.Unlock()
+		stB := s.getOrCreateState("beta")
+		stB.mu.Lock()
+		stB.lastDispatch = now.Add(-5 * time.Minute)
+		stB.mu.Unlock()
+
+		// beta's head has now waited past D (rebuilt queue with an old head).
+		_, qB2 := makeInfo("beta", now.Add(-700*time.Second))
+		got := s.Pick(0, map[string]QueueInfo{idA: qA, idB: qB2})
+		require.NotNil(t, got)
+		return got.FlowKey().ID
+	}
+	assert.Equal(t, "alpha", setup(0), "control: without D the warm member wins")
+	assert.Equal(t, "beta", setup(600*time.Second), "D-expired head preempts the warm-EDF candidate")
+}
+
+// TestGroupTurn_MaxWait_FCFSAmongExpiredAndOutsider pins the ordering among
+// expired heads (oldest first) and that an expired outsider is dispatched
+// without membership when the group is full — the SLO bound outranks the
+// entry contract, exactly like the all-idle gap fill.
+func TestGroupTurn_MaxWait_FCFSAmongExpiredAndOutsider(t *testing.T) {
+	s := newGroupTurn(1, 100)
+	s.maxWait = 600 * time.Second
+	now := time.Now()
+
+	idA, qA := makeInfo("alpha", now.Add(-2*time.Second))
+	queues := map[string]QueueInfo{idA: qA}
+	require.NotNil(t, s.Pick(0, queues))
+	gtDispatch(s, "alpha") // in flight, holds the group's only seat
+
+	// Two outsiders past D: the older head wins.
+	idB, qB := makeInfo("beta", now.Add(-700*time.Second))
+	idC, qC := makeInfo("gamma", now.Add(-601*time.Second))
+	got := s.Pick(0, map[string]QueueInfo{idA: qA, idB: qB, idC: qC})
+	require.NotNil(t, got)
+	assert.Equal(t, "beta", got.FlowKey().ID, "FCFS among D-expired heads: oldest wins")
+	assert.True(t, s.isMember("alpha"), "in-flight member keeps its seat")
+	assert.False(t, s.isMember("beta"), "D dispatch does not grant membership (gap-fill semantics)")
+	assert.False(t, s.isMember("gamma"))
+}
+
+// TestGroupTurn_MaxWait_BoundaryIsInclusive pins the >= edge of the bound
+// with a controlled clock: a head waiting exactly D is expired; a hair under
+// is not.
+func TestGroupTurn_MaxWait_BoundaryIsInclusive(t *testing.T) {
+	s := newGroupTurn(4, 100)
+	s.maxWait = 600 * time.Second
+	now := time.Now()
+
+	w := []groupTurnWaiting{{id: "alpha", headEnq: now.Add(-600 * time.Second)}}
+	assert.Equal(t, "alpha", s.pickMaxWaitLocked(w, now), "wait == D counts as expired")
+
+	w = []groupTurnWaiting{{id: "alpha", headEnq: now.Add(-600*time.Second + time.Millisecond)}}
+	assert.Equal(t, "", s.pickMaxWaitLocked(w, now), "wait just under D is not expired")
+
+	w = []groupTurnWaiting{{id: "alpha", headEnq: now.Add(-600*time.Second - time.Millisecond)}}
+	assert.Equal(t, "alpha", s.pickMaxWaitLocked(w, now), "wait just past D is expired")
+}
+
+// TestGroupTurn_OnAborted_ReleasesSeatWithoutCharging pins the abort
+// arithmetic: the in-flight seat is released and lastActivity advances, but
+// nothing else moves — no service charge, no completion mean update, and
+// lastPrompt keeps its previous value (an aborted request's prefix was
+// likely never cached; p14 §9.1).
+func TestGroupTurn_OnAborted_ReleasesSeatWithoutCharging(t *testing.T) {
+	s := newGroupTurn(4, 100)
+	now := time.Now()
+
+	gtDispatch(s, "alpha")
+	gtComplete(s, "alpha", 1000, 500) // service 2000, lastPrompt 1000, one completion
+	gtDispatch(s, "alpha")            // second request in flight
+
+	s.OnAborted(nil, &fwksched.InferenceRequest{FairnessID: "alpha"})
+
+	st := s.getOrCreateState("alpha")
+	_, _, inFlight, _, lastActivity := st.snapshot()
+	assert.Zero(t, inFlight, "abort releases the in-flight seat")
+	assert.True(t, lastActivity.After(now), "abort advances lastActivity (hold-time accounting)")
+	assert.Equal(t, 2000.0, st.Service(now, 0), "no service charged for an aborted request")
+	st.mu.Lock()
+	lastPrompt, meanCost, completions := st.lastPrompt, st.meanCost, st.completions
+	st.mu.Unlock()
+	assert.Equal(t, 1000.0, lastPrompt, "lastPrompt keeps its previous value")
+	assert.Equal(t, int64(1), completions, "abort does not count as a completion")
+	assert.Equal(t, 2000.0, meanCost, "completion mean untouched by the abort")
+}
+
+// TestGroupTurn_AbortUnblocksHoldExit pins the production leak fix end to
+// end at the strategy level: an aborted in-flight request must release its
+// seat so the hold-time exit can later fire. Before the fix, a client
+// disconnect mid-stream left inFlight permanently > 0, so the member was
+// never hold-exited, never evictable, and its pending-service term never
+// dissolved (p14 §9.1).
+func TestGroupTurn_AbortUnblocksHoldExit(t *testing.T) {
+	s := newGroupTurn(1, 100)
+	s.holdDuration = 50 * time.Millisecond
+	now := time.Now()
+
+	idA, qA := makeInfo("alpha", now.Add(-2*time.Second))
+	queues := map[string]QueueInfo{idA: qA}
+	require.NotNil(t, s.Pick(0, queues))
+	gtDispatch(s, "alpha") // in flight, never completes naturally
+
+	// The client disconnects mid-stream; the framework delivers this as a
+	// forced EndOfStream with a non-natural TerminationCause (the plugin
+	// wiring is covered in plugin_test.go).
+	s.OnAborted(nil, &fwksched.InferenceRequest{FairnessID: "alpha"})
+
+	// Once the hold time lapses, alpha must leave the group instead of
+	// pinning its seat forever.
+	st := s.getOrCreateState("alpha")
+	st.mu.Lock()
+	st.lastActivity = now.Add(-time.Minute)
+	st.mu.Unlock()
+
+	idB, qB := makeInfo("beta", now)
+	got := s.Pick(0, map[string]QueueInfo{idB: qB})
+	require.NotNil(t, got)
+	assert.Equal(t, "beta", got.FlowKey().ID)
+	assert.False(t, s.isMember("alpha"), "seat freed by hold-time exit after the abort")
 }
 
 func newAdaptive(gMax int) *groupTurnStrategy {

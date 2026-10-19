@@ -54,6 +54,23 @@ func TestFactory_UnknownStrategy(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestFactory_GroupTurnMinimalV3Config pins the v3 minimal config surface:
+// strategy: group-turn alone is complete — the sentinel group (4096), the
+// fixed knee (tau = 120 s) and the max-wait bound (D = 600 s) are the
+// defaults, so groupTurnUrgencySeconds/groupTurnMaxWaitSeconds are optional
+// overrides, not required settings.
+func TestFactory_GroupTurnMinimalV3Config(t *testing.T) {
+	p, err := ProgramAwarePluginFactory("test", decoder(`{"strategy":"group-turn"}`), nil)
+	require.NoError(t, err)
+	require.NotNil(t, p)
+	gt, ok := p.(*ProgramAwarePlugin).strategy.(*groupTurnStrategy)
+	require.True(t, ok)
+	assert.Equal(t, 4096, gt.groupSize)
+	assert.Equal(t, 120*time.Second, gt.warmKnee())
+	assert.Equal(t, 600*time.Second, gt.maxWait)
+	assert.False(t, gt.adaptive)
+}
+
 func TestFactory_InvalidConfig(t *testing.T) {
 	cases := map[string]string{
 		"negative ttl":       `{"evictionTtlSeconds":-1}`,
@@ -233,6 +250,50 @@ func TestResponseBody_NilSafe(t *testing.T) {
 	p := &ProgramAwarePlugin{}
 	p.ResponseBody(context.Background(), nil, &fwkrc.Response{EndOfStream: true}, nil)
 	p.ResponseBody(context.Background(), &fwksched.InferenceRequest{}, nil, nil)
+}
+
+// TestResponseBody_AbortedVsCompleted pins the TerminationCause wiring: the
+// framework guarantees exactly one EndOfStream per dispatched request (its
+// deferred cleanup force-fires one with a fresh context when the client
+// disconnects and the stream never completes naturally), and a non-natural
+// cause settles the request as an abort — in-flight released, no service
+// charged, no completion recorded — while a natural cause keeps the
+// completion path (p14 §9.1).
+func TestResponseBody_AbortedVsCompleted(t *testing.T) {
+	gt := newGroupTurn(4, 100)
+	p := &ProgramAwarePlugin{strategy: gt}
+
+	// Client disconnect mid-stream: the forced end-of-stream arrives with a
+	// non-natural cause.
+	req := &fwksched.InferenceRequest{FairnessID: "alpha"}
+	_ = p.PreRequest(context.Background(), req, nil)
+	m := p.getOrCreateMetrics("alpha")
+	seed := m.LastCompletionTime()
+
+	p.ResponseBody(context.Background(), req, &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseClientDisconnect,
+	}, nil)
+
+	assert.Equal(t, int64(0), m.InFlight(), "abort releases the metrics in-flight seat")
+	assert.Equal(t, seed, m.LastCompletionTime(), "abort records no completion")
+	_, _, inFlight, _, _ := gt.getOrCreateState("alpha").snapshot()
+	assert.Zero(t, inFlight, "abort releases the strategy in-flight seat")
+	assert.Equal(t, int64(1), m.DispatchedCount(), "dispatch history is kept")
+	assert.Zero(t, gt.getOrCreateState("alpha").Service(time.Now(), 0), "no service charged for an aborted request")
+
+	// A natural completion still charges service and records the completion.
+	req2 := &fwksched.InferenceRequest{FairnessID: "alpha"}
+	_ = p.PreRequest(context.Background(), req2, nil)
+	resp := &fwkrc.Response{EndOfStream: true, TerminationCause: fwkrc.TerminationCauseNatural}
+	resp.Usage.PromptTokens = 100
+	resp.Usage.CompletionTokens = 50
+	time.Sleep(time.Millisecond)
+	p.ResponseBody(context.Background(), req2, resp, nil)
+
+	assert.Equal(t, int64(0), m.InFlight())
+	assert.True(t, m.LastCompletionTime().After(seed), "natural completion recorded")
+	assert.Equal(t, 200.0, gt.getOrCreateState("alpha").Service(time.Now(), 0), "completed request charged")
 }
 
 func TestEvictIdle_RemovesIdle(t *testing.T) {

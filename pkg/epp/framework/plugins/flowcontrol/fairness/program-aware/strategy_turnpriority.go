@@ -95,6 +95,9 @@ func (s *turnPriorityStrategy) Pick(_ int, queues map[string]QueueInfo) flowcont
 
 func (s *turnPriorityStrategy) OnPreRequest(_ *ProgramMetrics, _ *fwksched.InferenceRequest) {}
 
+// OnAborted is a no-op: turn-priority keeps no per-request in-flight state.
+func (s *turnPriorityStrategy) OnAborted(_ *ProgramMetrics, _ *fwksched.InferenceRequest) {}
+
 func (s *turnPriorityStrategy) OnCompleted(_ *ProgramMetrics, _ *fwksched.InferenceRequest, _ *fwkrc.Response) {
 }
 

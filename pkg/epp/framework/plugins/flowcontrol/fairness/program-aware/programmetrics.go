@@ -54,6 +54,16 @@ func (m *ProgramMetrics) RecordCompletion(now time.Time) {
 	m.lastCompletionTime = now
 }
 
+// RecordAborted settles a dispatched request whose stream terminated without
+// completing (client disconnect, eviction, upstream error). The in-flight
+// seat is released — without this, a disconnected client would keep the
+// program un-evictable forever, because evictIdle skips programs with
+// in-flight requests — but no completion time is recorded: the request did
+// not finish.
+func (m *ProgramMetrics) RecordAborted() {
+	m.inFlight.Add(-1)
+}
+
 func (m *ProgramMetrics) DispatchedCount() int64 { return m.dispatchedCount.Load() }
 func (m *ProgramMetrics) InFlight() int64        { return m.inFlight.Load() }
 

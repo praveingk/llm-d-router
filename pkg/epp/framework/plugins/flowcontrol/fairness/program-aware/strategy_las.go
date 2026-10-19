@@ -181,6 +181,10 @@ func (s *LASStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol.FlowQ
 
 func (s *LASStrategy) OnPreRequest(_ *ProgramMetrics, _ *fwksched.InferenceRequest) {}
 
+// OnAborted is a no-op: LAS keeps no per-request in-flight state, and an
+// aborted request never completed, so there is no cost to charge.
+func (s *LASStrategy) OnAborted(_ *ProgramMetrics, _ *fwksched.InferenceRequest) {}
+
 func (s *LASStrategy) OnCompleted(_ *ProgramMetrics, request *fwksched.InferenceRequest, response *fwkrc.Response) {
 	if request == nil || response == nil {
 		return

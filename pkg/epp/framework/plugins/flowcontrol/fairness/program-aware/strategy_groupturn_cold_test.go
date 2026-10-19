@@ -384,10 +384,13 @@ func TestGroupTurnCold_ConfigValidation(t *testing.T) {
 
 	// The knee requirement: the estimator classifies warmth by the warmth
 	// knee, so a budget without one degenerates to prompt denomination (the
-	// p7 idleness failure mode) and is refused.
+	// p7 idleness failure mode) and is refused. Urgency is zeroed explicitly:
+	// v3 flipped its default to 120 (fixed knee), and this case pins the
+	// no-knee refusal.
 	cfg = DefaultConfig()
 	cfg.Strategy = groupTurnStrategyName
 	cfg.GroupTurnColdBudgetTokensPerSec = 9000
+	cfg.GroupTurnUrgencySeconds = 0
 	err = cfg.validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "warmth knee", "budget without a knee refused")

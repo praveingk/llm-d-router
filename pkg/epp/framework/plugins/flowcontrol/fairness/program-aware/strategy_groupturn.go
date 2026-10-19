@@ -131,25 +131,40 @@ type groupTurnState struct {
 	pendingGap      time.Duration // inter-dispatch gap captured at dispatch (τ estimator input)
 }
 
-func (st *groupTurnState) Service(now time.Time, halfLifeSeconds float64) float64 {
-	st.mu.Lock()
-	defer st.mu.Unlock()
+// decayLocked folds the decay accrued since decayAnchor into service and
+// advances the anchor to now. halfLifeSeconds <= 0 disables decay. The
+// caller must hold mu.
+func (st *groupTurnState) decayLocked(now time.Time, halfLifeSeconds float64) {
 	if halfLifeSeconds > 0 && !st.decayAnchor.IsZero() {
 		if elapsed := now.Sub(st.decayAnchor).Seconds(); elapsed > 0 {
 			st.service *= math.Pow(0.5, elapsed/halfLifeSeconds)
 		}
 	}
 	st.decayAnchor = now
+}
+
+func (st *groupTurnState) Service(now time.Time, halfLifeSeconds float64) float64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.decayLocked(now, halfLifeSeconds)
 	return st.service
 }
 
-func (st *groupTurnState) AddService(cost float64) {
+// AddService charges a completed request's cost. The service accrued so far
+// is decayed up to now BEFORE the new cost lands, so a member's service ages
+// between its own completions exactly as it does while idle — the same LAS
+// semantics the simulation used. Charging without decaying first froze a
+// member's service at its stay's peak: two charges of 1000 ten half-lives
+// apart read 2000 where LAS reads ~1001, so a rotated-out member re-entered
+// the entry contest several half-lives heavier than its true decayed service
+// (p14 §3e).
+func (st *groupTurnState) AddService(cost float64, now time.Time, halfLifeSeconds float64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	st.decayLocked(now, halfLifeSeconds)
 	st.service += cost
 	st.completions++
 	st.meanCost += (cost - st.meanCost) / float64(st.completions)
-	st.decayAnchor = time.Now()
 }
 
 // EffectiveService is the entry-ranking currency: charged service plus an
@@ -162,12 +177,7 @@ func (st *groupTurnState) AddService(cost float64) {
 func (st *groupTurnState) EffectiveService(now time.Time, halfLifeSeconds, fallbackMean float64) float64 {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if halfLifeSeconds > 0 && !st.decayAnchor.IsZero() {
-		if elapsed := now.Sub(st.decayAnchor).Seconds(); elapsed > 0 {
-			st.service *= math.Pow(0.5, elapsed/halfLifeSeconds)
-		}
-	}
-	st.decayAnchor = now
+	st.decayLocked(now, halfLifeSeconds)
 	mean := fallbackMean
 	if st.completions > 0 {
 		mean = st.meanCost
@@ -220,6 +230,24 @@ func (st *groupTurnState) RecordCompletion(now time.Time, promptTokens float64) 
 	st.lastPrompt = promptTokens
 }
 
+// RecordAbort settles a dispatched request whose stream terminated without
+// completing (client disconnect, eviction, upstream error): the in-flight
+// seat is released and lastActivity advances so hold-time accounting stays
+// honest. Nothing else moves — no service is charged (the true cost is
+// unknown), the completion mean is not updated, and lastPrompt keeps its
+// previous value because an aborted request's prefix was likely never
+// cached (p14 §9.1). The inFlight floor guard makes a double-settle from any
+// unforeseen framework path a no-op instead of a negative count, which would
+// corrupt the pending-service estimate the same way a leak does.
+func (st *groupTurnState) RecordAbort(now time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.inFlight > 0 {
+		st.inFlight--
+	}
+	st.lastActivity = now
+}
+
 func (st *groupTurnState) BeginStay(now time.Time) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -252,6 +280,12 @@ var _ Strategy = &groupTurnStrategy{}
 //   - Rotated-out and evicted programs keep their (decayed) service by default,
 //     so a program away long enough re-enters with near-newcomer priority
 //     exactly when its prefix is cold anyway.
+//   - Above all of it sits the max-wait bound D: any waiting session whose
+//     head request has waited >= D is served next, oldest head first. D is
+//     the fairness contract's hard SLO — it preempts warmth-EDF on purpose,
+//     because bounding the overload tail is worth more than the cache hit of
+//     one more warm refresh (p14 §2: the tail past a few minutes is nearly
+//     free to cut).
 type groupTurnStrategy struct {
 	groupSize       int
 	turnQuota       int64
@@ -267,6 +301,13 @@ type groupTurnStrategy struct {
 	// When adaptive is on, the knee is controller-driven and this is the
 	// bootstrap/fallback value.
 	urgencySeconds time.Duration
+
+	// maxWait is the hard SLO on queue wait (D). Any waiting session — member
+	// or not — whose head request has waited >= D is served next, oldest head
+	// first, preempting warmth-EDF and the entry contract (an expired
+	// outsider is dispatched without membership, like the all-idle gap
+	// fill). <= 0 disables the bound.
+	maxWait time.Duration
 
 	// Self-balancing layer (strategy_groupturn_sb.go): when adaptive, the
 	// group size tracks the engine's running set and the warmth knee tracks
@@ -442,8 +483,8 @@ func (s *groupTurnStrategy) Pick(_ int, queues map[string]QueueInfo) flowcontrol
 		}
 	}
 
-	// 2-6 (seat fills, member pick, all-idle victim path, defensive fallback,
-	// turn-quota swap) plus the cold-write budget loop live in
+	// 2-7 (seat fills, max-wait bound, member pick, all-idle victim path,
+	// defensive fallback, turn-quota swap) plus the cold-write budget loop live in
 	// pickWithColdBudget (strategy_groupturn_cold.go); with the budget off it
 	// is the plain selection, behaviorally identical to the pre-budget
 	// strategy.
@@ -467,10 +508,20 @@ func (s *groupTurnStrategy) selectCandidateLocked(all, selectable []groupTurnWai
 		s.admitMemberLocked(cand, now)
 	}
 
-	// 3. Candidate: the waiting member least recently served.
+	// 3. Max-wait bound: any waiting session whose head has waited >= D is
+	// served next, oldest head first. This deliberately preempts warmth-EDF,
+	// the turn quota and the entry contract — D is the SLO the pick rule
+	// must never violate, and cutting the overload tail is exactly its job.
+	// It also returns before the quota-renewal branch, so an expired member
+	// dispatched out of order does not renew its stay.
+	if cand := s.pickMaxWaitLocked(selectable, now); cand != "" {
+		return cand
+	}
+
+	// 4. Candidate: the waiting member least recently served.
 	candID := s.pickLRSMemberLocked(selectable)
 
-	// 4. All-idle trigger: no member has work, but outsiders wait. Evict a
+	// 5. All-idle trigger: no member has work, but outsiders wait. Evict a
 	// victim and seat the entry-queue head. A member with an in-flight request
 	// is never a victim: its turn is in progress and evicting it would push its
 	// next mid-turn request back into the entry queue. When no member is
@@ -500,7 +551,7 @@ func (s *groupTurnStrategy) selectCandidateLocked(all, selectable []groupTurnWai
 	if candID == "" {
 		// Defensive: waiting flows exist but none admissible and no member
 		// waiting. Fall back to the oldest eligible head so dispatch never
-		// stalls. The step-4 pre-screen (pickAffordableEntrantLocked) defers
+		// stalls. The step-5 pre-screen (pickAffordableEntrantLocked) defers
 		// unaffordable entrants in place, so by the time we get here every
 		// head in `selectable` may be deferred and the re-filter empty: that
 		// is an idle pick (the caller handles ""), never an index out of
@@ -512,7 +563,7 @@ func (s *groupTurnStrategy) selectCandidateLocked(all, selectable []groupTurnWai
 		return ""
 	}
 
-	// 5. Turn quota: rotate the exhausted member out for the entry-queue head
+	// 6. Turn quota: rotate the exhausted member out for the entry-queue head
 	// (only when outsiders wait); otherwise renew its stay.
 	if s.quotaExhaustedLocked(candID) {
 		if s.hasWaitingNonMemberLocked(selectable) {
@@ -604,6 +655,31 @@ func entrantBetter(policy string, svc float64, enq time.Time, id string, bestSvc
 		return enq.Before(bestEnq)
 	}
 	return id < bestID
+}
+
+// pickMaxWaitLocked returns the waiting session whose head request has
+// waited past the max-wait bound D, oldest head first (FCFS among the
+// expired; ties break to the lexicographically smaller ID for determinism).
+// Any session qualifies, member or not: with the v3 sentinel group everyone
+// is a member, but the rule is written generally — an expired outsider is
+// dispatched without membership, exactly like the all-idle gap fill, because
+// the SLO bound outranks the entry contract. maxWait <= 0 (zero-value
+// strategies in tests) disables the bound.
+func (s *groupTurnStrategy) pickMaxWaitLocked(waiting []groupTurnWaiting, now time.Time) string {
+	if s.maxWait <= 0 {
+		return ""
+	}
+	best := ""
+	var bestEnq time.Time
+	for _, w := range waiting {
+		if now.Sub(w.headEnq) < s.maxWait {
+			continue
+		}
+		if best == "" || w.headEnq.Before(bestEnq) || (w.headEnq.Equal(bestEnq) && w.id < best) {
+			best, bestEnq = w.id, w.headEnq
+		}
+	}
+	return best
 }
 
 // pickLRSMemberLocked returns the waiting member to dispatch next. With
@@ -723,6 +799,19 @@ func (s *groupTurnStrategy) OnPreRequest(_ *ProgramMetrics, request *fwksched.In
 	st.RecordDispatch(now)
 }
 
+// OnAborted settles a stream that terminated without completing (client
+// disconnect, eviction, upstream error). The plugin calls it from the final
+// EndOfStream callback when the framework reports a non-natural termination
+// cause; without it, a disconnected client would leak the in-flight seat
+// forever — blocking hold-exit and TTL eviction and pinning the pending
+// service term in effective service (p14 §9.1).
+func (s *groupTurnStrategy) OnAborted(_ *ProgramMetrics, request *fwksched.InferenceRequest) {
+	if request == nil {
+		return
+	}
+	s.getOrCreateState(programIDFor(request)).RecordAbort(time.Now())
+}
+
 func (s *groupTurnStrategy) OnCompleted(_ *ProgramMetrics, request *fwksched.InferenceRequest, response *fwkrc.Response) {
 	if request == nil || response == nil {
 		return
@@ -733,7 +822,7 @@ func (s *groupTurnStrategy) OnCompleted(_ *ProgramMetrics, request *fwksched.Inf
 	promptTokens := float64(response.Usage.PromptTokens)
 	st.RecordCompletion(now, promptTokens)
 	cost := float64(weightInputToken*int64(response.Usage.PromptTokens) + weightOutputToken*int64(response.Usage.CompletionTokens))
-	st.AddService(cost)
+	st.AddService(cost, now, s.halfLifeSeconds)
 	s.pendingMu.Lock()
 	s.pendingSum += cost
 	s.pendingCount++

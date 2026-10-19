@@ -59,6 +59,7 @@ type Config struct {
 	GroupTurnHoldSeconds     float64 `json:"groupTurnHoldSeconds,omitempty"`
 	GroupTurnHalfLifeSeconds float64 `json:"groupTurnHalfLifeSeconds,omitempty"`
 	GroupTurnUrgencySeconds  float64 `json:"groupTurnUrgencySeconds,omitempty"`
+	GroupTurnMaxWaitSeconds  float64 `json:"groupTurnMaxWaitSeconds,omitempty"`
 
 	GroupTurnAdaptive       bool    `json:"groupTurnAdaptive,omitempty"`
 	GroupTurnAdaptiveGMax   int     `json:"groupTurnAdaptiveGMax,omitempty"`
@@ -80,14 +81,20 @@ func DefaultConfig() Config {
 		TurnPriorityTimeWeight:        0.05,
 		TurnPriorityInactivitySeconds: 120,
 
-		GroupTurnSize:            32,
+		GroupTurnSize:            4096,
 		GroupTurnQuota:           4,
 		GroupTurnEntryPolicy:     groupTurnEntryLeastService,
 		GroupTurnVictimPolicy:    groupTurnVictimLongestIdle,
 		GroupTurnCreditPolicy:    groupTurnCreditKeep,
 		GroupTurnHoldSeconds:     120,
 		GroupTurnHalfLifeSeconds: 60,
-		GroupTurnUrgencySeconds:  0,
+		// v3 defaults (p13/p14 direction): the group is a sentinel — G is no
+		// longer a meaningful knob (membership never binds; every waiting
+		// session is a member), still settable for experiments. The knee is a
+		// fixed tau (warmth-EDF on at 120 s) rather than controller-driven:
+		// adaptive stays off. D is the hard max-wait SLO.
+		GroupTurnUrgencySeconds: 120,
+		GroupTurnMaxWaitSeconds: 600,
 
 		GroupTurnAdaptive:       false,
 		GroupTurnAdaptiveGMax:   256,
@@ -149,6 +156,9 @@ func (c Config) validate() error {
 	}
 	if c.GroupTurnUrgencySeconds < 0 {
 		return fmt.Errorf("groupTurnUrgencySeconds must be >= 0, got %v", c.GroupTurnUrgencySeconds)
+	}
+	if c.GroupTurnMaxWaitSeconds <= 0 {
+		return fmt.Errorf("groupTurnMaxWaitSeconds must be > 0, got %v", c.GroupTurnMaxWaitSeconds)
 	}
 	if c.GroupTurnAdaptive {
 		if c.GroupTurnAdaptiveGMax < 16 {
@@ -361,6 +371,21 @@ func (p *ProgramAwarePlugin) PreRequest(_ context.Context, request *fwksched.Inf
 
 // ResponseBody acts on the final stream chunk only; intermediate chunks are
 // no-ops.
+//
+// The final chunk settles the request exactly once, as a completion or an
+// abort. The framework guarantees this call fires for every dispatched
+// request even when the client disconnects mid-stream, the request is
+// evicted, or the stream errors: the ext_proc server's deferred cleanup
+// force-invokes HandleResponseBody(EndOfStream) with a fresh context when
+// the response never completed naturally, and finishResponse plus that
+// defer share the responseComplete gate, so exactly one EndOfStream reaches
+// this plugin per request. TerminationCause says why the stream ended; a
+// non-natural cause (client-disconnect, evicted, error) settles as an abort:
+// the in-flight seat is released but no service is charged and no completion
+// recorded, because the request never finished (p14 §9.1 — the leaked-seat
+// bug this closes). The eviction package's ctx.Done() net is not needed
+// here: this path is synchronous with the termination event and cannot
+// double-fire.
 func (p *ProgramAwarePlugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, _ *datalayer.EndpointMetadata) {
 	if request == nil || response == nil || !response.EndOfStream {
 		return
@@ -368,6 +393,11 @@ func (p *ProgramAwarePlugin) ResponseBody(_ context.Context, request *fwksched.I
 	id := programIDFor(request)
 	metrics := p.getOrCreateMetrics(id)
 
+	if response.TerminationCause != "" && response.TerminationCause != fwkrc.TerminationCauseNatural {
+		metrics.RecordAborted()
+		p.getStrategy().OnAborted(metrics, request)
+		return
+	}
 	p.getStrategy().OnCompleted(metrics, request, response)
 	metrics.RecordCompletion(time.Now())
 }

@@ -33,7 +33,14 @@ type Strategy interface {
 	Name() string
 	Pick(bandPriority int, queues map[string]QueueInfo) flowcontrol.FlowQueueAccessor
 	OnPreRequest(metrics *ProgramMetrics, request *fwksched.InferenceRequest)
+	// OnCompleted settles a request whose stream ended naturally.
 	OnCompleted(metrics *ProgramMetrics, request *fwksched.InferenceRequest, response *fwkrc.Response)
+	// OnAborted settles a request whose stream terminated without completing
+	// (client disconnect, eviction, upstream error): release per-request
+	// accounting without charging service. The plugin invokes exactly one of
+	// OnCompleted/OnAborted per dispatched request, keyed on the framework's
+	// TerminationCause.
+	OnAborted(metrics *ProgramMetrics, request *fwksched.InferenceRequest)
 	EvictProgram(id string)
 	Collectors() []prometheus.Collector
 }
@@ -67,6 +74,7 @@ func newStrategy(cfg Config) (Strategy, error) {
 			holdDuration:           time.Duration(cfg.GroupTurnHoldSeconds * float64(time.Second)),
 			halfLifeSeconds:        cfg.GroupTurnHalfLifeSeconds,
 			urgencySeconds:         time.Duration(cfg.GroupTurnUrgencySeconds * float64(time.Second)),
+			maxWait:                time.Duration(cfg.GroupTurnMaxWaitSeconds * float64(time.Second)),
 			adaptive:               cfg.GroupTurnAdaptive,
 			gMax:                   cfg.GroupTurnAdaptiveGMax,
 			kneeMax:                time.Duration(cfg.GroupTurnKneeMaxSeconds * float64(time.Second)),
