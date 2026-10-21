@@ -241,13 +241,22 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	if err := d.runRequestHeaderProcessors(ctx, reqCtx.SchedulingRequest); err != nil {
 		return reqCtx, err
 	}
-	// Derive FairnessID from agent-identity attribute if not already set by explicit header.
-	if reqCtx.SchedulingRequest.FairnessID == "" {
-		if agentID, ok := fwksched.ReadRequestAttribute[string](reqCtx.SchedulingRequest, agentidentity.AgentIdentityKey); ok && agentID != "" {
-			reqCtx.SchedulingRequest.FairnessID = agentID
-		} else {
-			reqCtx.SchedulingRequest.FairnessID = metadata.DefaultFairnessID
-		}
+	// Derive the FairnessID from the fairness-ID header (tenant identity) and the
+	// agent-identity attribute (program/session identity). A request carrying both —
+	// production traffic stamped with a tenant fairness ID whose clients also send
+	// session headers — gets a composed ID "<tenant>/<session>": flow control keys one
+	// queue per session, and the fairness ID keeps the tenant visible for isolation
+	// and metric labels. A request carrying only one identity keys the flow on it
+	// alone, and a request carrying neither falls back to the default flow. Tenant IDs
+	// must not contain the separator (see metadata.FairnessIDTenantSeparator).
+	agentID, _ := fwksched.ReadRequestAttribute[string](reqCtx.SchedulingRequest, agentidentity.AgentIdentityKey)
+	switch {
+	case reqCtx.SchedulingRequest.FairnessID != "" && agentID != "":
+		reqCtx.SchedulingRequest.FairnessID += metadata.FairnessIDTenantSeparator + agentID
+	case agentID != "":
+		reqCtx.SchedulingRequest.FairnessID = agentID
+	case reqCtx.SchedulingRequest.FairnessID == "":
+		reqCtx.SchedulingRequest.FairnessID = metadata.DefaultFairnessID
 	}
 
 	// Admit may block until flow control admits the request.

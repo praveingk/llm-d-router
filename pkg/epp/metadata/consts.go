@@ -71,6 +71,15 @@ const (
 	// This ensures that requests without explicit fairness identifiers are still grouped and managed by the Flow Control
 	// system.
 	DefaultFairnessID = "default-flow"
+
+	// FairnessIDTenantSeparator separates the tenant prefix from the program/session
+	// identity in a composed fairness ID: "<tenant>/<session>". The Director builds such
+	// IDs when a request carries both a fairness-ID header (the tenant part) and an
+	// agent-identity attribute (the session part), so the tenant prefixes the session ID
+	// instead of replacing it, and flow control keys one queue per session while the
+	// tenant stays part of flow identity and metrics. Session IDs may contain the
+	// separator; tenant IDs must not.
+	FairnessIDTenantSeparator = "/"
 )
 
 // All headerAliases keys and values must be lower case.

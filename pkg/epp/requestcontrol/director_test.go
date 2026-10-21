@@ -626,7 +626,7 @@ func TestDirector_HandleRequest(t *testing.T) {
 			wantFairnessID: "session-abc",
 		},
 		{
-			name: "explicit fairness header takes precedence over agent-identity attribute",
+			name: "fairness header and agent-identity attribute compose into a tenant-prefixed fairness ID",
 			reqBodyMap: map[string]any{
 				"model":  model,
 				"prompt": "critical prompt",
@@ -637,13 +637,33 @@ func TestDirector_HandleRequest(t *testing.T) {
 			},
 			initialTargetModelName: model,
 			inferenceObjectiveName: objectiveName,
-			fairnessIDHeader:       "explicit-id",
+			fairnessIDHeader:       "tenant-1",
 			requestHeaderPlugin: &mockRequestHeaderPlugin{
 				name:           "agent-identity",
 				attributeKey:   agentidentity.AgentIdentityKey,
 				attributeValue: "session-abc",
 			},
-			wantFairnessID: "explicit-id",
+			wantFairnessID: "tenant-1/session-abc",
+		},
+		{
+			name: "empty agent-identity attribute does not compose",
+			reqBodyMap: map[string]any{
+				"model":  model,
+				"prompt": "critical prompt",
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			inferenceObjectiveName: objectiveName,
+			fairnessIDHeader:       "tenant-1",
+			requestHeaderPlugin: &mockRequestHeaderPlugin{
+				name:           "agent-identity",
+				attributeKey:   agentidentity.AgentIdentityKey,
+				attributeValue: "",
+			},
+			wantFairnessID: "tenant-1",
 		},
 		{
 			name: "successful request with preRequest plugin adding key",
