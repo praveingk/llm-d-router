@@ -148,7 +148,7 @@ func (b renderBackend) renderLegacyResponses(ctx context.Context, r *fwkrh.Respo
 	return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
 		TokenIDs:           tokenIDs,
 		MultiModalFeatures: convertMMFeaturesToUpstream(mmFeatures),
-	}}}, nil
+	}}, LegacyTranslated: true}, nil
 }
 
 func responsesPayload(r *fwkrh.ResponsesRequest) (fwkrh.PayloadMap, error) {

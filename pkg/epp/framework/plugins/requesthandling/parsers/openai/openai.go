@@ -46,7 +46,6 @@ const (
 	responsesAPI       = "responses"
 	chatCompletionsAPI = "chat/completions"
 	completionsAPI     = "completions"
-	promptField        = "prompt"
 	embeddingsAPI      = "embeddings"
 	// imagesGenerationsAPI is the OpenAI-compatible image generation endpoint/
 	imagesGenerationsAPI = "images/generations"
@@ -165,8 +164,8 @@ func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers ma
 // envelope, and the string fields each keeps opaque. Prompt content is decoded
 // once into the typed body; the original bytes are forwarded unless mutated.
 var envelopeRawFields = map[string][]string{
-	chatCompletionsAPI: {promptField},
-	completionsAPI:     {promptField},
+	chatCompletionsAPI: {reqcommon.FieldPrompt},
+	completionsAPI:     {reqcommon.FieldPrompt},
 	responsesAPI:       {reqcommon.FieldInput, reqcommon.FieldInstructions},
 }
 

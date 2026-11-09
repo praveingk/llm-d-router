@@ -109,13 +109,19 @@ func TestMessagesRenderMode(t *testing.T) {
 				require.NoError(t, err)
 				req := &scheduling.InferenceRequest{Body: parsed.Body, Headers: map[string]string{"authorization": "Bearer secret"}}
 				require.NoError(t, p.Produce(context.Background(), req, nil))
-				require.Equal(t, &fwkrh.TokenizedRequest{
+				expected := &fwkrh.TokenizedRequest{
 					CacheSalt: "tenant-a",
 					Prompts: []fwkrh.PromptTokens{{
 						TokenIDs:           []uint32{1, 2, 3},
 						MultiModalFeatures: []fwkrh.MultiModalFeature{{Modality: reqcommon.ModalityImage, Hash: "hash", Offset: 1, Length: 2}},
 					}},
-				}, req.Body.TokenizedRequest)
+				}
+				if tc.legacy {
+					// The Go-side legacy translation renders the translated body, not the
+					// client's original request, so its IDs are marked LegacyTranslated.
+					expected.LegacyTranslated = true
+				}
+				require.Equal(t, expected, req.Body.TokenizedRequest)
 				require.Equal(t, fwkrh.RawPayload(raw), req.Body.WirePayload())
 				require.False(t, req.Body.Mutated)
 				unchanged, err := json.Marshal(req.Body.Messages)

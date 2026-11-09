@@ -121,7 +121,7 @@ func (b renderBackend) renderLegacyMessages(ctx context.Context, msg *fwkrh.Mess
 	return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
 		TokenIDs:           tokenIDs,
 		MultiModalFeatures: convertMMFeaturesToUpstream(mmFeatures),
-	}}}, nil
+	}}, LegacyTranslated: true}, nil
 }
 
 func legacyMessagesPayload(msg *fwkrh.MessagesRequest) fwkrh.PayloadMap {

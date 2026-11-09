@@ -26,6 +26,7 @@ import (
 	"strings"
 	"testing"
 
+	commonrequest "github.com/llm-d/llm-d-router/pkg/common/request"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	parserutil "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/util"
 )
@@ -351,7 +352,7 @@ func BenchmarkOpenAIParser_ChatCompletions(b *testing.B) {
 			return err
 		}},
 		{name: "Envelope", run: func(body []byte) error {
-			result, err := parserutil.UnmarshalEnvelope(body, promptField)
+			result, err := parserutil.UnmarshalEnvelope(body, commonrequest.FieldPrompt)
 			benchmarkChatEnvelope = result
 			return err
 		}},

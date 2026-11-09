@@ -63,6 +63,7 @@ const (
 	mooncakeBootstrapPortFlag = "mooncake-bootstrap-port"
 	p2pConnectorPortFlag      = "p2p-connector-port"
 	enableP2PPull             = "enable-p2p-pull"
+	forwardPromptTokenIDs     = "forward-prompt-token-ids"
 	enableSSRFProtection      = "enable-ssrf-protection"
 	enablePrefillerSampling   = "enable-prefiller-sampling"
 	enableTLS                 = "enable-tls"
@@ -122,6 +123,7 @@ type yamlConfiguration struct {
 	EnableSSRFProtection    *bool    `json:"enable-ssrf-protection,omitempty"`
 	EnablePrefillerSampling *bool    `json:"enable-prefiller-sampling,omitempty"`
 	EnableP2PPull           *bool    `json:"enable-p2p-pull,omitempty"`
+	ForwardPromptTokenIDs   *bool    `json:"forward-prompt-token-ids,omitempty"`
 	SecureServing           *bool    `json:"secure-serving,omitempty"`
 	SecureProxy             *bool    `json:"secure-proxy,omitempty"`
 	CertPath                string   `json:"cert-path,omitempty"`
@@ -275,6 +277,8 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"the EC protocol between encoder and prefiller (for EPD mode). Supported: "+supportedECConnectorNamesStr+". Leave empty to skip encoder stage.")
 	fs.IntVar(&opts.MooncakeBootstrapPort, mooncakeBootstrapPortFlag, opts.MooncakeBootstrapPort,
 		"the port used to query the Mooncake bootstrap endpoint on prefill pods (only used with --kv-connector=mooncake)")
+	fs.BoolVar(&opts.ForwardPromptTokenIDs, forwardPromptTokenIDs, opts.ForwardPromptTokenIDs,
+		"Carry kv_transfer_params.prompt_token_ids onto prefill and decode requests. Only enable behind a gateway running the forward-prompt-token-ids EPP plugin.")
 	fs.IntVar(&opts.P2PConnectorPort, p2pConnectorPortFlag, opts.P2PConnectorPort,
 		"the prefiller's OffloadingConnector P2P tier listening port, injected as remote_port on the decode request; with --data-parallel-size > 1 this is the rank-0 port and rank r uses port+r (used with --kv-connector=offloading or --enable-p2p-pull)")
 	fs.BoolVar(&opts.EnableP2PPull, enableP2PPull, opts.EnableP2PPull,
@@ -829,6 +833,9 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	}
 	if cfg.EnableP2PPull != nil && !opts.isFlagSet(enableP2PPull) {
 		opts.EnableP2PPull = *cfg.EnableP2PPull
+	}
+	if cfg.ForwardPromptTokenIDs != nil && !opts.isFlagSet(forwardPromptTokenIDs) {
+		opts.ForwardPromptTokenIDs = *cfg.ForwardPromptTokenIDs
 	}
 
 	if !opts.isSecureServingFlagSet() {

@@ -76,7 +76,9 @@ func (s *Server) handleP2P(w http.ResponseWriter, r *http.Request, prefillPodHos
 			requestFieldKVRequestID: kvRequestID,
 		},
 	}
+	promptTokenIDs := s.clientPromptTokenIDs(requestData)
 	s.addP2PPullToPrefill(prefillKVParams, kvCacheSource, prefillPodHostPort)
+	setPromptTokenIDs(prefillKVParams, promptTokenIDs)
 	prefillData[reqcommon.FieldKVTransferParams] = prefillKVParams
 	reqcommon.CapSingleToken(prefillData, apiType)
 
@@ -101,6 +103,7 @@ func (s *Server) handleP2P(w http.ResponseWriter, r *http.Request, prefillPodHos
 			reqcommon.FieldRemotePort: prefillP2PPort,
 		},
 	}
+	setPromptTokenIDs(decodeData[reqcommon.FieldKVTransferParams].(map[string]any), promptTokenIDs)
 
 	decodeBody, err := json.Marshal(decodeData)
 	if err != nil {
@@ -361,8 +364,11 @@ func (s *Server) decodeWithP2PSource(w http.ResponseWriter, r *http.Request, sou
 
 	p2pParams := s.p2pSourceParams(source)
 	// Rebuild kv_transfer_params from scratch: the sidecar owns this field, so
-	// client-supplied keys are dropped rather than forwarded to vLLM.
-	requestData[reqcommon.FieldKVTransferParams] = map[string]any{requestFieldRemoteKVSource: p2pParams}
+	// client-supplied keys are dropped rather than forwarded to vLLM, except
+	// prompt_token_ids, which only lets the engine skip re-tokenizing.
+	sourceKVParams := map[string]any{requestFieldRemoteKVSource: p2pParams}
+	setPromptTokenIDs(sourceKVParams, s.clientPromptTokenIDs(requestData))
+	requestData[reqcommon.FieldKVTransferParams] = sourceKVParams
 
 	s.logger.Info("running P2P source protocol",
 		"source_host", extractHost(source),
