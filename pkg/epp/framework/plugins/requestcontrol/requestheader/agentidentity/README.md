@@ -25,7 +25,9 @@ After the plugin returns, the Director checks:
 2. Else if `"agent-identity"` attribute exists → copy to FairnessID.
 3. Else → `"default-flow"`.
 
-The plugin is stateless and safe under concurrent use.
+With `publishIdentity: false` the plugin resolves the identity but stores no attribute, so the Director and every other consumer behave as if agent-identity were not configured. Use it to measure session-header coverage (`metrics: true`) before letting the identity drive fairness.
+
+Without `metrics` the plugin is stateless. With it, the plugin keeps the bounded active-session set described under [Metrics](#metrics). It is safe under concurrent use either way.
 
 ## Inputs Consumed
 
@@ -33,7 +35,27 @@ The plugin is stateless and safe under concurrent use.
 
 ## Outputs Produced
 
-- `scheduling.InferenceRequest` attribute `"agent-identity"` (`string`) — set when a session header matches.
+- `scheduling.InferenceRequest` attribute `"agent-identity"` (`string`) — set when a session header matches and `publishIdentity` is true (the default). With `publishIdentity: false` nothing is stored and `Produces()` declares nothing, so a plugin that requires the attribute (for example `session-state-producer`) fails configuration loading rather than silently reading nothing.
+
+## Metrics
+
+With `metrics: true`, on the EPP's `/metrics` endpoint:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `llm_d_epp_agent_identity_requests_total` | counter | `harness`, `session_header` | Requests seen by the plugin. `session_header` is the header the identity was resolved from, or `none`. `harness` is the `user-agent` product token (text before the first `/` or space, lowercased, `[a-z0-9._-]`, at most 64 characters): `unknown` when `user-agent` is absent or blank, `other` when it cannot be parsed or beyond 50 distinct values. |
+| `llm_d_epp_agent_identity_active_sessions` | gauge | `harness` | Distinct session identities that sent a request in the last 5 minutes, labelled with the harness of the session's first request. Refreshed every 15 seconds; a harness with no active session has no series. |
+
+No label carries a session ID. To count active sessions the plugin keeps, per session, only a seeded 8-byte hash of the identity, its last-seen time and its harness; sessions idle for more than 5 minutes are dropped. The set holds at most 100000 sessions; sessions first seen while it is full are not counted, so the gauge is then a lower bound. No statistics are kept about what happens within a session.
+
+Share of requests that carry a session identity:
+
+```promql
+sum(increase(llm_d_epp_agent_identity_requests_total{session_header!="none"}[7d]))
+  / sum(increase(llm_d_epp_agent_identity_requests_total[7d]))
+```
+
+Behind a proxy that replaces `user-agent` (for example LiteLLM), `harness` reports the proxy unless it forwards the client's user agent.
 
 ## Configuration
 
@@ -45,6 +67,8 @@ The plugin is stateless and safe under concurrent use.
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
 | `additionalSessionHeaders` | `[]string` | No | `[]` | Extra header names to check before the built-in defaults. Order is preserved; the first non-empty match wins. Use this to support a new agent, or to track an upstream rename, without a code change. |
+| `publishIdentity` | `bool` | No | `true` | Store the resolved identity as the `"agent-identity"` attribute. `false` resolves it without storing it, so it cannot affect fairness or scheduling. |
+| `metrics` | `bool` | No | `false` | Export `llm_d_epp_agent_identity_requests_total` and `llm_d_epp_agent_identity_active_sessions`. |
 
 ### Examples
 
@@ -68,6 +92,18 @@ plugins:
       additionalSessionHeaders:
         - x-my-agent-session
         - x-another-agent-id
+```
+
+Measure session-header coverage without letting it influence routing:
+
+```yaml
+apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+  - type: agent-identity
+    parameters:
+      publishIdentity: false
+      metrics: true
 ```
 
 ### Per-agent client setup

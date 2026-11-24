@@ -24,7 +24,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -68,10 +72,18 @@ type Parameters struct {
 	// AdditionalSessionHeaders is prepended to the built-in default list.
 	// Order is preserved; the request-time loop short-circuits on first match.
 	AdditionalSessionHeaders []string `json:"additionalSessionHeaders,omitempty"`
+	// PublishIdentity writes the resolved identity to the agent-identity
+	// request attribute. Defaults to true. When false the plugin still
+	// resolves the identity (for Metrics) but writes no attribute, so no
+	// consumer can act on it.
+	PublishIdentity *bool `json:"publishIdentity,omitempty"`
+	// Metrics exports llm_d_epp_agent_identity_requests_total and
+	// llm_d_epp_agent_identity_active_sessions. Defaults to false.
+	Metrics bool `json:"metrics,omitempty"`
 }
 
 // PluginFactory is the factory function for the agent identity plugin.
-func PluginFactory(name string, rawParameters *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
+func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	var params Parameters
 	if rawParameters != nil {
 		if err := rawParameters.Decode(&params); err != nil {
@@ -79,10 +91,29 @@ func PluginFactory(name string, rawParameters *json.Decoder, _ plugin.Handle) (p
 		}
 	}
 
-	return &Plugin{
+	p := &Plugin{
 		typedName:       plugin.TypedName{Type: PluginType, Name: name},
 		priorityHeaders: mergeHeaders(params.AdditionalSessionHeaders, defaultPriorityHeaders),
-	}, nil
+		silent:          params.PublishIdentity != nil && !*params.PublishIdentity,
+	}
+	if params.Metrics {
+		var reg prometheus.Registerer
+		if handle != nil {
+			reg = handle.Metrics()
+		}
+		requests, active, err := registerMetrics(reg)
+		if err != nil {
+			return nil, fmt.Errorf("agent-identity: failed to register metrics: %w", err)
+		}
+		p.requests = requests
+		p.activeGauge = active
+		p.harnessLabels = newHarnessLabels(maxHarnessLabelValues)
+		p.active = newActiveSessions(maxActiveSessions)
+		if handle != nil {
+			go p.runActiveSessions(handle.Context())
+		}
+	}
+	return p, nil
 }
 
 // mergeHeaders returns extras followed by defaults, lowercased. Request headers
@@ -111,6 +142,15 @@ var (
 type Plugin struct {
 	typedName       plugin.TypedName
 	priorityHeaders []string
+	// silent is publishIdentity: false. The zero value publishes, as before.
+	silent bool
+
+	// The fields below are nil unless metrics is enabled.
+	requests        *prometheus.CounterVec
+	activeGauge     *prometheus.GaugeVec
+	harnessLabels   *metrics.BoundedLabel
+	active          *activeSessions
+	activeHarnesses map[string]int // owned by the refresh goroutine
 }
 
 func (p *Plugin) TypedName() plugin.TypedName {
@@ -118,17 +158,40 @@ func (p *Plugin) TypedName() plugin.TypedName {
 }
 
 // Produces declares the agent identity request attribute written by this
-// request-header processor.
+// request-header processor. With publishIdentity: false it declares nothing,
+// so a plugin that requires the attribute fails configuration loading instead
+// of silently reading nothing.
 func (p *Plugin) Produces() map[plugin.DataKey]any {
+	if p.silent {
+		return nil
+	}
 	return map[plugin.DataKey]any{AgentIdentityKey: ""}
 }
 
 func (p *Plugin) RequestHeader(_ context.Context, request *scheduling.InferenceRequest) error {
-	for _, header := range p.priorityHeaders {
-		if id := strings.TrimSpace(request.Headers[header]); id != "" {
-			request.PutAttribute(AgentIdentityKey, id)
+	header, id := p.resolve(request.Headers)
+	if header != "" && !p.silent {
+		request.PutAttribute(AgentIdentityKey, id)
+	}
+	if p.requests != nil {
+		harness := p.harness(request.Headers)
+		if header == "" {
+			p.requests.WithLabelValues(harness, sessionHeaderNone).Inc()
 			return nil
 		}
+		p.requests.WithLabelValues(harness, header).Inc()
+		p.active.observe(id, harness, time.Now())
 	}
 	return nil
+}
+
+// resolve returns the first priority header with a non-empty trimmed value and
+// that value, or two empty strings when none matches.
+func (p *Plugin) resolve(headers map[string]string) (header, id string) {
+	for _, h := range p.priorityHeaders {
+		if v := strings.TrimSpace(headers[h]); v != "" {
+			return h, v
+		}
+	}
+	return "", ""
 }
