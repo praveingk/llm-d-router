@@ -27,6 +27,11 @@ limitations under the License.
 // session IDs are never emitted; the table is keyed by a salted SHA-256 hash
 // truncated to 16 bytes, so metric output cannot be joined back to a client
 // session.
+//
+// Hook split: RequestHeader (before admission) counts requests, bytes, turns
+// and session creation; PreRequest (after the scheduler picked an endpoint)
+// begins in-flight accounting, so requests shed before dispatch never
+// inflate the in-flight gauge; ResponseBody (end of stream) settles it.
 package sessionobserver
 
 import (
@@ -71,12 +76,13 @@ const (
 const maxHarnessTokenLength = 64
 
 // inflightExpiryTTL bounds how long an in-flight request entry may live
-// without a completion. The ResponseBody hook fires for every request that
-// picked a pod — including failed, aborted, evicted and disconnected streams —
-// but requests rejected before a pod was picked (admission denial, no
-// endpoints, scheduler error) have no completion hook at this commit. Those
-// entries are expired by the sweep and counted under the "expired" eviction
-// reason instead of leaking forever.
+// without a completion. In-flight accounting begins at PreRequest, so only
+// dispatched requests carry entries; the ResponseBody hook fires for every
+// request that picked a pod — including failed, aborted, evicted and
+// disconnected streams. The TTL is a backstop for the rare dispatched
+// request whose completion the EPP never observes; those entries are
+// expired by the sweep and counted under the "expired" eviction reason
+// instead of leaking forever.
 const inflightExpiryTTL = 900 * time.Second
 
 // windowInflight is the sessions_active window label counting sessions with
@@ -285,6 +291,7 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 // declares no data dependency, so the data layer treats it as fully passive.
 var (
 	_ requestcontrol.RequestHeaderProcessor = &Plugin{}
+	_ requestcontrol.PreRequest             = &Plugin{}
 	_ requestcontrol.ResponseBodyProcessor  = &Plugin{}
 )
 
@@ -296,7 +303,8 @@ func (p *Plugin) TypedName() plugin.TypedName {
 // RequestHeader runs after the InferenceRequest is assembled and before
 // admission control — the earliest request hook, the same one the
 // agent-identity plugin uses. It reads headers and the request body size,
-// counts the request, and tracks the session. It never mutates the request.
+// counts the request, and tracks the session (turns, lastSeen). It performs
+// no in-flight accounting and never mutates the request.
 func (p *Plugin) RequestHeader(_ context.Context, request *scheduling.InferenceRequest) error {
 	if request == nil {
 		return nil
@@ -318,12 +326,38 @@ func (p *Plugin) RequestHeader(_ context.Context, request *scheduling.InferenceR
 	}
 
 	hash := p.table.hashSession(sessionID)
-	sessHarness, created, inflightAfter := p.table.track(hash, harness, request.RequestID, now, p.onEvict)
+	sessHarness, created := p.table.trackSession(hash, harness, now, p.onEvict)
 	if created {
 		p.metrics.started.WithLabelValues(sessHarness).Inc()
 	}
+	return nil
+}
+
+// PreRequest runs after the scheduler has picked an endpoint for the
+// request, immediately before it is forwarded to the model server. In-flight
+// accounting begins here — not in RequestHeader — so requests that never
+// reach dispatch (flow-control shed and 429s, admission denial, no
+// endpoints, scheduler error) are counted by RequestHeader but never
+// inflated into sessions_active{window="inflight"}, which would otherwise
+// over-report for the 900s expiry TTL exactly while the system is shedding.
+// The session hash is recomputed from request.Headers with the same
+// resolveSessionID rather than stashed on the request. The hook always
+// returns nil: a passive observer must never fail a request.
+func (p *Plugin) PreRequest(_ context.Context, request *scheduling.InferenceRequest, _ *scheduling.SchedulingResult) error {
+	if request == nil || request.RequestID == "" {
+		return nil
+	}
+
+	_, sessionID := resolveSessionID(request.Headers, p.params.SessionHeaders, p.params.MaxSessionIdBytes)
+	if sessionID == "" {
+		return nil
+	}
+	hash := p.table.hashSession(sessionID)
+	harness := p.resolveHarness(request.Headers)
+
+	sessHarness, inflightAfter := p.table.beginInflight(hash, harness, request.RequestID, p.now(), p.onEvict)
 	if inflightAfter == 1 {
-		// 0 -> 1 transition: the session now has an in-flight request.
+		// 0 -> 1 transition: the session now has a dispatched request.
 		p.metrics.addActive(sessHarness, windowInflight, 1)
 	}
 	return nil
@@ -333,8 +367,9 @@ func (p *Plugin) RequestHeader(_ context.Context, request *scheduling.InferenceR
 // EndOfStream=true exactly once per request that picked a pod — including
 // streams that failed, were aborted, were evicted or were torn down by a
 // client disconnect (TerminationCause carries which). The decrement here is
-// idempotent; requests that never picked a pod have no completion hook and
-// are expired by the sweep instead.
+// idempotent. A dispatched request whose completion somehow never fires (a
+// crash between hooks, a teardown the EPP never observes) is expired by the
+// sweep after 900s as a backstop.
 func (p *Plugin) ResponseBody(_ context.Context, request *scheduling.InferenceRequest, response *requestcontrol.Response, _ *datalayer.EndpointMetadata) {
 	if response == nil || !response.EndOfStream {
 		return

@@ -97,6 +97,27 @@ func mustRequestHeader(t *testing.T, p *Plugin, req *scheduling.InferenceRequest
 	}
 }
 
+// mustDispatch runs the PreRequest hook, simulating the director having
+// picked an endpoint for the request.
+func mustDispatch(t *testing.T, p *Plugin, req *scheduling.InferenceRequest) {
+	t.Helper()
+	if err := p.PreRequest(context.Background(), req, nil); err != nil {
+		t.Fatalf("PreRequest: %v", err)
+	}
+}
+
+// fullTurn runs the complete happy-path hook sequence for a request:
+// counted, dispatched, and settled.
+func fullTurn(t *testing.T, p *Plugin, req *scheduling.InferenceRequest) {
+	t.Helper()
+	mustRequestHeader(t, p, req)
+	mustDispatch(t, p, req)
+	p.ResponseBody(context.Background(), req, &requestcontrol.Response{
+		RequestID:   req.RequestID,
+		EndOfStream: true,
+	}, nil)
+}
+
 // settle completes a request through the plugin's completion hook.
 func settle(t *testing.T, p *Plugin, requestID string) {
 	t.Helper()
@@ -407,11 +428,10 @@ func TestHarnessFixedAtFirstRequest(t *testing.T) {
 	p, _, _ := newTestPlugin(t, "")
 
 	turn := func(id, session, ua string) {
-		mustRequestHeader(t, p, newRequest(id, map[string]string{
+		fullTurn(t, p, newRequest(id, map[string]string{
 			"x-session-id": session,
 			"user-agent":   ua,
 		}, 10))
-		settle(t, p, id)
 	}
 
 	turn("r1", "s1", "opencode/1.0.2")
@@ -444,10 +464,9 @@ func TestActiveGaugesPerWindow(t *testing.T) {
 	// Ages at sweep time: d=5000s (outside 1h, inside the idle timeout),
 	// c=1000s (outside 5m, inside 1h), b=100s (inside 5m), a=0s (in flight).
 	req := func(id, session string) {
-		mustRequestHeader(t, p, newRequest(id, map[string]string{
+		fullTurn(t, p, newRequest(id, map[string]string{
 			"x-session-id": session, "user-agent": "opencode/1",
 		}, 10))
-		settle(t, p, id)
 	}
 	req("r-d", "d")
 	clock.Advance(4000 * time.Second)
@@ -455,9 +474,12 @@ func TestActiveGaugesPerWindow(t *testing.T) {
 	clock.Advance(900 * time.Second)
 	req("r-b", "b")
 	clock.Advance(100 * time.Second)
-	mustRequestHeader(t, p, newRequest("r-a", map[string]string{
+	// Dispatched but never settled: counts as in flight.
+	inflightReq := newRequest("r-a", map[string]string{
 		"x-session-id": "a", "user-agent": "opencode/1",
-	}, 10)) // stays in flight
+	}, 10)
+	mustRequestHeader(t, p, inflightReq)
+	mustDispatch(t, p, inflightReq)
 
 	p.sweepOnce(clock.Now())
 
@@ -493,15 +515,50 @@ func TestActiveGaugesPerWindow(t *testing.T) {
 func TestInflightUpDown(t *testing.T) {
 	p, _, _ := newTestPlugin(t, "")
 
-	mustRequestHeader(t, p, newRequest("r1", map[string]string{"x-session-id": "s1"}, 10))
+	// A request that only reached RequestHeader — rejected before dispatch
+	// by flow control (429), admission, or endpoint selection — is counted
+	// but never in flight, and leaves nothing for the expiry backstop to
+	// clean up.
+	rejected := newRequest("r-rejected", map[string]string{"x-session-id": "s-rej"}, 10)
+	mustRequestHeader(t, p, rejected)
+	if got := gaugeValue(t, p, "unknown", "inflight"); got != 0 {
+		t.Errorf("inflight gauge after a rejected request = %v, want 0", got)
+	}
+	if got := p.table.inflightLen(); got != 0 {
+		t.Errorf("in-flight entries after a rejected request = %d, want 0", got)
+	}
+	if got := counterValue(t, p, "requests", "unknown", "x-session-id"); got != 1 {
+		t.Errorf("rejected request should still be counted, got %v", got)
+	}
+	if got := counterValue(t, p, "started", "unknown"); got != 1 {
+		t.Errorf("rejected request should still create its session, got %v", got)
+	}
+
+	r1 := newRequest("r1", map[string]string{"x-session-id": "s1"}, 10)
+	mustRequestHeader(t, p, r1)
+	if got := gaugeValue(t, p, "unknown", "inflight"); got != 0 {
+		t.Errorf("inflight gauge after RequestHeader only = %v, want 0 (not dispatched yet)", got)
+	}
+	mustDispatch(t, p, r1)
 	if got := gaugeValue(t, p, "unknown", "inflight"); got != 1 {
-		t.Errorf("inflight gauge after first request = %v, want 1", got)
+		t.Errorf("inflight gauge after dispatch = %v, want 1", got)
 	}
 
 	// Second request on the same session: still one session in flight.
-	mustRequestHeader(t, p, newRequest("r2", map[string]string{"x-session-id": "s1"}, 10))
+	r2 := newRequest("r2", map[string]string{"x-session-id": "s1"}, 10)
+	mustRequestHeader(t, p, r2)
+	mustDispatch(t, p, r2)
 	if got := gaugeValue(t, p, "unknown", "inflight"); got != 1 {
-		t.Errorf("inflight gauge after second request = %v, want 1", got)
+		t.Errorf("inflight gauge after second dispatch = %v, want 1", got)
+	}
+
+	// A repeated PreRequest for the same request ID must not double-count.
+	mustDispatch(t, p, r2)
+	if got := gaugeValue(t, p, "unknown", "inflight"); got != 1 {
+		t.Errorf("inflight gauge after duplicate dispatch = %v, want 1", got)
+	}
+	if got := p.table.inflightLen(); got != 2 {
+		t.Errorf("in-flight entries after duplicate dispatch = %d, want 2", got)
 	}
 
 	// Intermediate chunks do not decrement.
@@ -520,6 +577,7 @@ func TestInflightUpDown(t *testing.T) {
 	} {
 		req := newRequest("r-cause", map[string]string{"x-session-id": "s-cause"}, 10)
 		mustRequestHeader(t, p, req)
+		mustDispatch(t, p, req)
 		p.ResponseBody(context.Background(), req, &requestcontrol.Response{
 			RequestID:        "r-cause",
 			EndOfStream:      true,
@@ -552,13 +610,16 @@ func TestInflightUpDown(t *testing.T) {
 }
 
 func TestInflightExpiry(t *testing.T) {
-	// A request that never completes — the pre-pod rejection path, which
-	// has no completion hook — is expired by the sweep after 900s.
+	// A dispatched request whose completion never fires — the backstop
+	// case, e.g. a teardown the EPP never observes — is expired by the
+	// sweep after 900s.
 	p, clock, reg := newTestPlugin(t, `{"sessionIdleTimeoutSeconds": 7200}`)
 
-	mustRequestHeader(t, p, newRequest("orphan", map[string]string{
+	orphan := newRequest("orphan", map[string]string{
 		"x-session-id": "s1", "user-agent": "opencode/1",
-	}, 10))
+	}, 10)
+	mustRequestHeader(t, p, orphan)
+	mustDispatch(t, p, orphan)
 	if got := gaugeValue(t, p, "opencode", "inflight"); got != 1 {
 		t.Fatalf("inflight gauge before expiry = %v, want 1", got)
 	}
@@ -588,6 +649,50 @@ func TestInflightExpiry(t *testing.T) {
 	}
 }
 
+// TestRejectedBeforeDispatch covers requests that reach RequestHeader but
+// never PreRequest — flow-control sheds and 429s under saturation, admission
+// denials, no-endpoint and scheduler errors. They are counted and tracked as
+// sessions, but never enter the in-flight gauge, and the 900s expiry
+// backstop has nothing to clean up for them.
+func TestRejectedBeforeDispatch(t *testing.T) {
+	p, clock, _ := newTestPlugin(t, `{"sessionIdleTimeoutSeconds": 3600}`)
+
+	for i := 0; i < 3; i++ {
+		req := newRequest(fmt.Sprintf("shed-%d", i), map[string]string{
+			"x-session-id": "shed-session", "user-agent": "opencode/1",
+		}, 100)
+		mustRequestHeader(t, p, req) // rejected before PreRequest
+	}
+
+	if got := counterValue(t, p, "requests", "opencode", "x-session-id"); got != 3 {
+		t.Errorf("requests = %v, want 3", got)
+	}
+	if got := counterValue(t, p, "requestBytes", "opencode", "x-session-id"); got != 300 {
+		t.Errorf("requestBytes = %v, want 300", got)
+	}
+	if got := counterValue(t, p, "started", "opencode"); got != 1 {
+		t.Errorf("started = %v, want 1", got)
+	}
+	if got := gaugeValue(t, p, "opencode", "inflight"); got != 0 {
+		t.Errorf("inflight gauge = %v, want 0", got)
+	}
+	if got := p.table.inflightLen(); got != 0 {
+		t.Errorf("in-flight entries = %d, want 0", got)
+	}
+
+	// Long after the 900s expiry TTL, the sweep reports nothing expired:
+	// no entry was ever created. The session is dropped only by the idle
+	// timeout.
+	clock.Advance(2 * time.Hour)
+	p.sweepOnce(clock.Now())
+	if got := counterValue(t, p, "evictions", "expired"); got != 0 {
+		t.Errorf("expired = %v, want 0 (no entry was ever created)", got)
+	}
+	if got := counterValue(t, p, "evictions", "idle"); got != 1 {
+		t.Errorf("idle = %v, want 1", got)
+	}
+}
+
 func TestIdleEvictionAndHistograms(t *testing.T) {
 	// Idle timeout well under the 900s in-flight TTL, so the "stuck"
 	// session's entry is still live when the idle pass runs and the
@@ -595,27 +700,29 @@ func TestIdleEvictionAndHistograms(t *testing.T) {
 	p, clock, _ := newTestPlugin(t, `{"sessionIdleTimeoutSeconds": 60}`)
 
 	// Session old: two turns 600s apart, both settled, last seen 155s ago.
-	mustRequestHeader(t, p, newRequest("old-1", map[string]string{
+	old1 := newRequest("old-1", map[string]string{
 		"x-session-id": "old", "user-agent": "opencode/1",
-	}, 10))
-	settle(t, p, "old-1")
+	}, 10)
+	fullTurn(t, p, old1)
 	clock.Advance(600 * time.Second)
-	mustRequestHeader(t, p, newRequest("old-2", map[string]string{
+	old2 := newRequest("old-2", map[string]string{
 		"x-session-id": "old", "user-agent": "opencode/1",
-	}, 10))
-	settle(t, p, "old-2")
-	// Session stuck: one request 155s ago, never settled. Its in-flight
-	// entry (155s < 900s TTL) keeps the session alive despite the idle
-	// timeout having passed.
-	mustRequestHeader(t, p, newRequest("stuck", map[string]string{
+	}, 10)
+	fullTurn(t, p, old2)
+	// Session stuck: one dispatched request 155s ago, never settled. Its
+	// in-flight entry (155s < 900s TTL) keeps the session alive despite
+	// the idle timeout having passed.
+	stuck := newRequest("stuck", map[string]string{
 		"x-session-id": "stuck", "user-agent": "opencode/1",
-	}, 10))
+	}, 10)
+	mustRequestHeader(t, p, stuck)
+	mustDispatch(t, p, stuck)
 	clock.Advance(145 * time.Second)
 	// Session fresh: settled 10s ago.
-	mustRequestHeader(t, p, newRequest("fresh", map[string]string{
+	fresh := newRequest("fresh", map[string]string{
 		"x-session-id": "fresh", "user-agent": "opencode/1",
-	}, 10))
-	settle(t, p, "fresh")
+	}, 10)
+	fullTurn(t, p, fresh)
 	clock.Advance(10 * time.Second)
 
 	p.sweepOnce(clock.Now()) // old idle 155s, stuck idle 155s, fresh idle 10s
@@ -648,26 +755,30 @@ func TestCapacityEviction(t *testing.T) {
 	p, clock, _ := newTestPlugin(t, `{"maxSessions": 3}`)
 
 	// s1: idle, least recently active. s2: idle, more recent. s3: in flight.
-	mustRequestHeader(t, p, newRequest("r1", map[string]string{
+	s1 := newRequest("r1", map[string]string{
 		"x-session-id": "s1", "user-agent": "opencode/1",
-	}, 10))
-	settle(t, p, "r1")
+	}, 10)
+	fullTurn(t, p, s1)
 	clock.Advance(100 * time.Second)
-	mustRequestHeader(t, p, newRequest("r2", map[string]string{
+	s2 := newRequest("r2", map[string]string{
 		"x-session-id": "s2", "user-agent": "opencode/1",
-	}, 10))
-	settle(t, p, "r2")
+	}, 10)
+	fullTurn(t, p, s2)
 	clock.Advance(100 * time.Second)
-	mustRequestHeader(t, p, newRequest("r3", map[string]string{
+	s3 := newRequest("r3", map[string]string{
 		"x-session-id": "s3", "user-agent": "opencode/1",
-	}, 10))
+	}, 10)
+	mustRequestHeader(t, p, s3)
+	mustDispatch(t, p, s3)
 	clock.Advance(100 * time.Second)
 
 	// Inserting s4 beyond the cap evicts s1 (least recently active idle
 	// session), never the more recent idle s2 nor the in-flight s3.
-	mustRequestHeader(t, p, newRequest("r4", map[string]string{
+	s4 := newRequest("r4", map[string]string{
 		"x-session-id": "s4", "user-agent": "opencode/1",
-	}, 10))
+	}, 10)
+	mustRequestHeader(t, p, s4)
+	mustDispatch(t, p, s4)
 
 	if got := counterValue(t, p, "evictions", "capacity"); got != 1 {
 		t.Errorf("capacity evictions = %v, want 1", got)
@@ -695,8 +806,11 @@ func TestCapacityEviction(t *testing.T) {
 	// All sessions in flight: the table may exceed the cap rather than
 	// evict a live session.
 	p2, _, _ := newTestPlugin(t, `{"maxSessions": 1}`)
-	mustRequestHeader(t, p2, newRequest("i1", map[string]string{"x-session-id": "i1"}, 10))
-	mustRequestHeader(t, p2, newRequest("i2", map[string]string{"x-session-id": "i2"}, 10))
+	for _, id := range []string{"i1", "i2"} {
+		req := newRequest(id, map[string]string{"x-session-id": id}, 10)
+		mustRequestHeader(t, p2, req)
+		mustDispatch(t, p2, req)
+	}
 	if got := p2.table.len(); got != 2 {
 		t.Errorf("in-flight protection: table length = %d, want 2 (cap exceeded, no live session dropped)", got)
 	}
@@ -750,9 +864,10 @@ func TestPluginIsPassive(t *testing.T) {
 	req := newRequest("r1", headers, 42)
 
 	mustRequestHeader(t, p, req)
+	mustDispatch(t, p, req)
 	settle(t, p, "r1")
 
-	// No request attribute was written.
+	// No request attribute was written by any hook.
 	if keys := req.AttributeKeys(); len(keys) != 0 {
 		t.Errorf("plugin wrote request attributes %v, want none", keys)
 	}
@@ -781,9 +896,13 @@ func TestPluginIsPassive(t *testing.T) {
 	if _, ok := any(p).(fwkplugin.ProducerPlugin); ok {
 		t.Error("plugin must not implement ProducerPlugin (it produces no data)")
 	}
-	// Nil requests and responses are handled without panic.
+	// Nil requests and responses are handled without panic, including a
+	// PreRequest with a nil scheduling result.
 	if err := p.RequestHeader(context.Background(), nil); err != nil {
 		t.Errorf("nil request: %v", err)
+	}
+	if err := p.PreRequest(context.Background(), nil, nil); err != nil {
+		t.Errorf("nil PreRequest: %v", err)
 	}
 	p.ResponseBody(context.Background(), nil, nil, nil)
 }
@@ -805,13 +924,17 @@ func TestMetricsRegisteredOnServedRegistry(t *testing.T) {
 	p := pi.(*Plugin)
 
 	// Drive one request, one evicting sweep (so the eviction-observed
-	// histograms get a series), and a second request (so the sweep's
-	// recompute leaves a live sessions_active series); every collector
-	// then has at least one series to expose.
-	mustRequestHeader(t, p, newRequest("r1", map[string]string{"x-session-id": "s1"}, 10))
+	// histograms get a series), and a second dispatched request (so the
+	// sweep's recompute leaves a live sessions_active series); every
+	// collector then has at least one series to expose.
+	r1 := newRequest("r1", map[string]string{"x-session-id": "s1"}, 10)
+	mustRequestHeader(t, p, r1)
+	mustDispatch(t, p, r1)
 	p.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
 	p.sweepOnce(p.now())
-	mustRequestHeader(t, p, newRequest("r2", map[string]string{"x-session-id": "s2"}, 10))
+	r2 := newRequest("r2", map[string]string{"x-session-id": "s2"}, 10)
+	mustRequestHeader(t, p, r2)
+	mustDispatch(t, p, r2)
 
 	families, err := ctrlmetrics.Registry.Gather()
 	if err != nil {

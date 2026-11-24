@@ -24,6 +24,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	runserver "github.com/llm-d/llm-d-router/pkg/epp/server"
 )
 
@@ -70,4 +71,18 @@ plugins:
 	p := r.PluginHandle.Plugin("session-observer")
 	require.NotNil(t, p, "session-observer plugin not found on the handle")
 	require.Equal(t, "session-observer", p.TypedName().Type)
+
+	// The director wires extension points by type-asserting each plugin
+	// from the handle (requestcontrol.Config.AddPlugins, fed by
+	// r.requestControlConfig.AddPlugins(handle.GetAllPlugins()...) in
+	// parseConfigurationPhaseTwo). A plugin listed only under `plugins:` — no
+	// profile stanza — reaches all three of this plugin's extension points
+	// exactly when it satisfies these three interfaces, so assert them on
+	// the production-config-instantiated plugin.
+	_, isHeader := p.(fwkrc.RequestHeaderProcessor)
+	_, isPre := p.(fwkrc.PreRequest)
+	_, isBody := p.(fwkrc.ResponseBodyProcessor)
+	require.True(t, isHeader, "session-observer must be collected as a RequestHeaderProcessor")
+	require.True(t, isPre, "session-observer must be collected as a PreRequest plugin (in-flight accounting)")
+	require.True(t, isBody, "session-observer must be collected as a ResponseBodyProcessor (completion hook)")
 }

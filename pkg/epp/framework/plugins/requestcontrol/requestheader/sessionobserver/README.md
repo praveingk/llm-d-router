@@ -1,7 +1,7 @@
 # Session Observer
 
 **Type:** `session-observer`
-**Interfaces:** `requestcontrol.RequestHeaderProcessor`, `requestcontrol.ResponseBodyProcessor`
+**Interfaces:** `requestcontrol.RequestHeaderProcessor`, `requestcontrol.PreRequest`, `requestcontrol.ResponseBodyProcessor`
 
 A **passive** observability plugin that records per-session usage metrics — how many
 sessions are active, from which client harness, how many turns they run, how long
@@ -25,13 +25,24 @@ table:
   harness header at all count as `unknown`.
 
 Per session (keyed by a **salted hash**, never the raw ID) it tracks first/last
-seen, turn count and in-flight requests. In-flight requests are keyed by request
-ID and decremented from the `ResponseBody` completion hook — which the director
-invokes with `EndOfStream=true` for every request that picked a pod, including
-failed, aborted, evicted and disconnected streams. Requests rejected before a pod
-was picked (admission denial, no endpoints) have no completion hook; their
-in-flight entries are expired by the sweep after 900 s and counted under the
-`expired` eviction reason.
+seen, turn count and in-flight requests. The work is split across three hooks:
+
+- **`RequestHeader`** (before admission) counts requests, bytes, turns and
+  session creation, and updates `lastSeen`.
+- **`PreRequest`** (after the scheduler picked an endpoint) begins in-flight
+  accounting, registering the request ID and applying the 0→1 transition of the
+  in-flight gauge. Starting here — not in `RequestHeader` — means requests
+  rejected before dispatch (flow-control shed and 429s under saturation,
+  admission denial, no endpoints, scheduler error) are counted but never
+  inflated into `sessions_active{window="inflight"}`, which would otherwise
+  over-report for the 900 s expiry TTL exactly while the system is shedding.
+- **`ResponseBody`** with `EndOfStream=true` settles the request. The director
+  invokes it for every request that picked a pod — including failed, aborted,
+  evicted and disconnected streams (`TerminationCause` carries which).
+
+A dispatched request whose completion somehow never fires (a crash between
+hooks, a teardown the EPP never observes) is expired by the sweep after 900 s
+and counted under the `expired` eviction reason. The decrement is idempotent.
 
 A background sweep (every `gaugeRefreshSeconds`, stopped with the plugin handle's
 context) evicts sessions idle past `sessionIdleTimeoutSeconds` with no in-flight
@@ -63,7 +74,7 @@ All metrics use the `llm_d_epp` subsystem and appear on the EPP's `:9090`
 |--------|------|--------|-------------|
 | `llm_d_epp_session_requests_total` | counter | `harness`, `session_header` | Observed requests. |
 | `llm_d_epp_session_request_bytes_total` | counter | `harness`, `session_header` | Observed request body bytes. |
-| `llm_d_epp_sessions_active` | gauge | `harness`, `window` | Sessions with ≥1 in-flight request (`window="inflight"`), and sessions whose last request arrived within each configured window (`300`→`5m`, `3600`→`1h`). |
+| `llm_d_epp_sessions_active` | gauge | `harness`, `window` | Sessions with at least one request **dispatched to a model server and not yet finished** (`window="inflight"`; requests queued in flow control are not in flight), and sessions whose last request arrived within each configured window (`300`→`5m`, `3600`→`1h`). |
 | `llm_d_epp_sessions_started_total` | counter | `harness` | Newly tracked sessions. |
 | `llm_d_epp_session_turns` | histogram | `harness` | Turns per evicted session. |
 | `llm_d_epp_session_duration_seconds` | histogram | `harness` | Active duration per evicted session. |
@@ -115,9 +126,10 @@ plugins:
 
 ## Limitations
 
-- **Pre-pod rejections leak for up to 900 s.** Requests rejected before a pod was
-  picked have no completion hook at this commit; their in-flight entries are
-  expired by the sweep (reason `expired`) rather than decremented immediately.
+- **Dispatched-but-unobserved completions leak for up to 900 s.** A request
+  whose completion the EPP never observes (crash between hooks, an unobserved
+  teardown) keeps its in-flight entry until the sweep expires it (reason
+  `expired`). Requests rejected before dispatch never carry an entry at all.
 - **Session identity is header-derived.** Clients that strip or rotate session
   headers appear as separate sessions; nothing deduplicates them.
 - **The table is per-replica.** Each EPP replica observes only the requests it

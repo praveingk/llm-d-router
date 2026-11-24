@@ -105,7 +105,7 @@ func newObserverMetrics() *observerMetrics {
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
 			Name:      "sessions_active",
 			Help: metricsutil.HelpMsgWithStability(
-				"Tracked sessions by harness and activity window: \"inflight\" counts sessions with at least one in-flight request; each configured window counts sessions whose last request arrived within it.",
+				"Tracked sessions by harness and activity window: \"inflight\" counts sessions with at least one request dispatched to a model server and not yet finished (requests queued in flow control are not in flight); each configured window counts sessions whose last request arrived within it.",
 				compbasemetrics.ALPHA),
 		}, []string{"harness", "window"}),
 		tableSize: prometheus.NewGauge(prometheus.GaugeOpts{

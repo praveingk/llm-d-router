@@ -89,12 +89,14 @@ func newSessionTable(maxSessions int, idleTimeout, inflightTTL time.Duration) *s
 	}
 }
 
-// track records one request for the session keyed by hash: it creates the
-// session when unseen (evicting for capacity first), bumps turns and
-// lastSeen, and registers the request as in-flight. It returns the session's
-// fixed harness, whether the session was created by this call, and the
-// session's in-flight count after the request is accounted.
-func (t *sessionTable) track(hash, harness, requestID string, now time.Time, onEvict func(eviction)) (sessHarness string, created bool, inflightAfter int) {
+// trackSession records one request for the session keyed by hash: it
+// creates the session when unseen (evicting for capacity first) and bumps
+// turns and lastSeen. It performs no in-flight accounting — that begins at
+// PreRequest, once the scheduler has picked a pod, so requests rejected
+// before dispatch (flow-control shed, admission denial, no endpoints)
+// never inflate the in-flight gauge. It returns the session's fixed
+// harness and whether the session was created by this call.
+func (t *sessionTable) trackSession(hash, harness string, now time.Time, onEvict func(eviction)) (sessHarness string, created bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -114,11 +116,39 @@ func (t *sessionTable) track(hash, harness, requestID string, now time.Time, onE
 	e.lastSeen = now
 	e.turns++
 	t.lru.MoveToBack(e.elem)
-	if requestID != "" {
-		t.inflight[requestID] = &inflightEntry{sess: e, started: now}
-		e.inflight++
+	return e.harness, created
+}
+
+// beginInflight registers requestID as in-flight on the session keyed by
+// hash. The session normally exists — RequestHeader created it on the same
+// request — but may have been capacity-evicted in the window between the
+// two hooks (it was not yet in flight, so it was evictable); in that case
+// it is re-created without counting a new turn or a new session start,
+// which RequestHeader already accounted. Idempotent per request ID.
+// It returns the session's fixed harness and its in-flight count after the
+// request is accounted.
+func (t *sessionTable) beginInflight(hash, harness, requestID string, now time.Time, onEvict func(eviction)) (sessHarness string, inflightAfter int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if existing, ok := t.inflight[requestID]; ok {
+		return existing.sess.harness, existing.sess.inflight
 	}
-	return e.harness, created, e.inflight
+	e, ok := t.sessions[hash]
+	if !ok {
+		t.evictForCapacityLocked(now, onEvict)
+		e = &sessionEntry{
+			hash:      hash,
+			harness:   harness,
+			firstSeen: now,
+			lastSeen:  now,
+		}
+		e.elem = t.lru.PushBack(hash)
+		t.sessions[hash] = e
+	}
+	t.inflight[requestID] = &inflightEntry{sess: e, started: now}
+	e.inflight++
+	return e.harness, e.inflight
 }
 
 // evictForCapacityLocked makes room for one new session by evicting the
