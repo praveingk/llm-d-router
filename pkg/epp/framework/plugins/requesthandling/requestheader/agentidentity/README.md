@@ -70,6 +70,7 @@ With `metrics: true`, on the EPP's `/metrics` endpoint:
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `llm_d_epp_agent_identity_requests_total` | counter | `harness`, `session_header` | Requests seen by the plugin. `session_header` is the header the session identity was resolved from, or `none`. `harness` is the `user-agent` product token (text before the first `/` or space, lowercased, `[a-z0-9._-]`, at most 64 characters): `unknown` when `user-agent` is absent or blank, `other` when it cannot be parsed or beyond 50 distinct values. |
+| `llm_d_epp_agent_identity_thread_requests_total` | counter | `harness`, `thread_header` | Requests seen by the plugin, by the header the thread identity was resolved from: the matched thread header (for example `x-claude-code-agent-id`, `thread-id`, `x-opencode-session-id`), `session` when no thread header matched and the thread falls back to the session identity, or `none` when the request has neither. Separate from `requests_total` so the two header labels do not multiply. |
 | `llm_d_epp_agent_identity_active_sessions` | gauge | `harness` | Distinct session identities this EPP replica saw in the last 5 minutes, labelled with the harness of the session's first request. Refreshed every 15 seconds; a harness with no active session has no series. |
 | `llm_d_epp_agent_identity_active_sessions_untracked_total` | counter | — | Requests whose session was not counted in `active_sessions` because the active-session set was full. Non-zero means the gauge is a lower bound. |
 
@@ -82,6 +83,13 @@ Share of requests that carry a session identity:
 ```promql
 sum(increase(llm_d_epp_agent_identity_requests_total{session_header!="none"}[7d]))
   / sum(increase(llm_d_epp_agent_identity_requests_total[7d]))
+```
+
+Share of requests that carry their own thread identity (a sub-agent or explicitly identified thread):
+
+```promql
+sum(increase(llm_d_epp_agent_identity_thread_requests_total{thread_header!~"session|none"}[7d]))
+  / sum(increase(llm_d_epp_agent_identity_thread_requests_total[7d]))
 ```
 
 Behind a proxy that replaces `user-agent` (for example LiteLLM), `harness` reports the proxy unless it forwards the client's user agent.
@@ -99,7 +107,7 @@ Behind a proxy that replaces `user-agent` (for example LiteLLM), `harness` repor
 | `additionalThreadHeaders` | `[]string` | No | `[]` | Extra thread-ID header names, prepended the same way as `additionalSessionHeaders`. |
 | `additionalParentThreadHeaders` | `[]string` | No | `[]` | Extra parent-ID header names, prepended the same way as `additionalSessionHeaders`. |
 | `publishIdentity` | `bool` | No | `true` | Store the resolved identities as request attributes. `false` resolves the session without storing anything, so it cannot affect fairness or scheduling; requires `metrics: true`. |
-| `metrics` | `bool` | No | `false` | Export `llm_d_epp_agent_identity_requests_total`, `llm_d_epp_agent_identity_active_sessions` and `llm_d_epp_agent_identity_active_sessions_untracked_total`. One instance per EPP. |
+| `metrics` | `bool` | No | `false` | Export `llm_d_epp_agent_identity_requests_total`, `llm_d_epp_agent_identity_thread_requests_total`, `llm_d_epp_agent_identity_active_sessions` and `llm_d_epp_agent_identity_active_sessions_untracked_total`. One instance per EPP. |
 
 ### Examples
 

@@ -42,6 +42,7 @@ func unregisterAgentIdentityMetrics(t *testing.T) {
 		ctrlmetrics.Registry.Unregister(prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llm_d_epp_agent_identity_requests_total"}, []string{"harness", "session_header"}))
 		ctrlmetrics.Registry.Unregister(prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llm_d_epp_agent_identity_active_sessions"}, []string{"harness"}))
 		ctrlmetrics.Registry.Unregister(prometheus.NewCounter(prometheus.CounterOpts{Name: "llm_d_epp_agent_identity_active_sessions_untracked_total"}))
+		ctrlmetrics.Registry.Unregister(prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llm_d_epp_agent_identity_thread_requests_total"}, []string{"harness", "thread_header"}))
 	})
 }
 
@@ -97,6 +98,7 @@ plugins:
 		present[mf.GetName()] = true
 	}
 	require.True(t, present["llm_d_epp_agent_identity_requests_total"], "requests counter not on the served registry")
+	require.True(t, present["llm_d_epp_agent_identity_thread_requests_total"], "thread requests counter not on the served registry")
 
 	// The gauge has no series until its first refresh, so check registration
 	// directly: registering the same name again must collide.

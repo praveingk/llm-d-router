@@ -382,3 +382,64 @@ func TestUntrackedCountsRequestsWhenFull(t *testing.T) {
 		t.Fatalf("untracked counter not registered (%d series)", n)
 	}
 }
+
+func threadCount(p *Plugin, harness, header string) float64 {
+	return testutil.ToFloat64(p.threadRequests.WithLabelValues(harness, header))
+}
+
+// TestThreadRequestCounting: thread_header is the matched thread header, the
+// session fallback, or none, in the plugin's thread priority order.
+func TestThreadRequestCounting(t *testing.T) {
+	p, _ := newTestPlugin(t, `{"metrics": true}`)
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+		want    string
+	}{
+		{"claude main thread", map[string]string{ClaudeCodeSessionHeader: "s"}, threadHeaderSession},
+		{"claude sub-agent", map[string]string{ClaudeCodeSessionHeader: "s", ClaudeCodeAgentHeader: "a1"}, ClaudeCodeAgentHeader},
+		{"codex thread", map[string]string{CodexSessionHeader: "s", CodexThreadHeader: "t1"}, CodexThreadHeader},
+		{"opencode own id", map[string]string{OpenCodeSessionHeader: "parent", OpenCodeOwnSessionHeader: "own"}, OpenCodeOwnSessionHeader},
+		{"standard header first", map[string]string{StandardThreadHeader: "t", ClaudeCodeAgentHeader: "a1", ClaudeCodeSessionHeader: "s"}, StandardThreadHeader},
+		{"thread without session", map[string]string{CodexThreadHeader: "t2"}, CodexThreadHeader},
+		{"blank thread header falls back", map[string]string{ClaudeCodeSessionHeader: "s", ClaudeCodeAgentHeader: "  "}, threadHeaderSession},
+		{"neither", map[string]string{}, sessionHeaderNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := threadCount(p, harnessUnknown, tc.want)
+			run(t, p, tc.headers)
+			if got := threadCount(p, harnessUnknown, tc.want) - before; got != 1 {
+				t.Fatalf("thread_requests{thread_header=%q} += %v, want 1", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestThreadMetricsWithPublishIdentityFalse: thread requests are counted in
+// observe-only mode while no thread attribute is written.
+func TestThreadMetricsWithPublishIdentityFalse(t *testing.T) {
+	p, _ := newTestPlugin(t, `{"publishIdentity": false, "metrics": true}`)
+	req := run(t, p, map[string]string{ClaudeCodeSessionHeader: "s", ClaudeCodeAgentHeader: "a1", "user-agent": "claude-cli/2"})
+	if got := threadCount(p, "claude-cli", ClaudeCodeAgentHeader); got != 1 {
+		t.Fatalf("thread request counted %v, want 1", got)
+	}
+	if _, ok := scheduling.ReadRequestAttribute[string](req, ThreadIDKey); ok {
+		t.Fatal("thread-id written with publishIdentity false")
+	}
+}
+
+// TestThreadIDsNeverInMetrics: thread and parent IDs never appear as label values.
+func TestThreadIDsNeverInMetrics(t *testing.T) {
+	p, reg := newTestPlugin(t, `{"metrics": true}`)
+	run(t, p, map[string]string{ClaudeCodeSessionHeader: "secret-s", ClaudeCodeAgentHeader: "secret-agent", ClaudeCodeParentAgentHeader: "secret-parent"})
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	text := fmt.Sprint(families)
+	for _, id := range []string{"secret-s", "secret-agent", "secret-parent"} {
+		if strings.Contains(text, id) {
+			t.Fatalf("%q found in gathered metrics", id)
+		}
+	}
+}

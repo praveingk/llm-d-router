@@ -29,8 +29,12 @@ import (
 
 const (
 	// sessionHeaderNone is the session_header label of a request that matched
-	// no session header.
+	// no session header, and the thread_header label of a request with neither
+	// a thread nor a session header.
 	sessionHeaderNone = "none"
+	// threadHeaderSession is the thread_header label of a request whose thread
+	// falls back to its session identity (no thread header matched).
+	threadHeaderSession = "session"
 	// harnessUnknown is the harness label of a request with no user-agent.
 	harnessUnknown = "unknown"
 	// harnessOther is the harness label of an unparsable user-agent and of
@@ -66,6 +70,18 @@ func newActiveSessionsGauge() *prometheus.GaugeVec {
 	}, []string{"harness"})
 }
 
+// newThreadRequestsCounter builds llm_d_epp_agent_identity_thread_requests_total.
+// It is separate from requests_total so the two header labels do not multiply.
+func newThreadRequestsCounter() *prometheus.CounterVec {
+	return prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:      "agent_identity_thread_requests_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"Requests seen by the agent-identity plugin, by the client's user-agent product token (harness) and the header the thread identity was resolved from (thread_header; \"session\" when the thread falls back to the session identity, \"none\" when the request has neither).",
+			compbasemetrics.ALPHA),
+	}, []string{"harness", "thread_header"})
+}
+
 // newUntrackedCounter builds llm_d_epp_agent_identity_active_sessions_untracked_total.
 func newUntrackedCounter() prometheus.Counter {
 	return prometheus.NewCounter(prometheus.CounterOpts{
@@ -82,6 +98,8 @@ type collectors struct {
 	requests  *prometheus.CounterVec
 	active    *prometheus.GaugeVec
 	untracked prometheus.Counter
+	// threadRequests counts requests by thread header.
+	threadRequests *prometheus.CounterVec
 }
 
 // errMetricsAlreadyEnabled rejects a second metrics-enabled agent-identity
@@ -94,15 +112,16 @@ var errMetricsAlreadyEnabled = errors.New("metrics are already enabled on anothe
 // those already registered are unregistered again.
 func registerMetrics(reg prometheus.Registerer) (*collectors, error) {
 	c := &collectors{
-		requests:  newRequestsCounter(),
-		active:    newActiveSessionsGauge(),
-		untracked: newUntrackedCounter(),
+		requests:       newRequestsCounter(),
+		active:         newActiveSessionsGauge(),
+		untracked:      newUntrackedCounter(),
+		threadRequests: newThreadRequestsCounter(),
 	}
 	if reg == nil {
 		return c, nil
 	}
 	var done []prometheus.Collector
-	for _, col := range []prometheus.Collector{c.requests, c.active, c.untracked} {
+	for _, col := range []prometheus.Collector{c.requests, c.active, c.untracked, c.threadRequests} {
 		if err := register(reg, col); err != nil {
 			for _, d := range done {
 				reg.Unregister(d)

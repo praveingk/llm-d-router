@@ -141,6 +141,7 @@ type Parameters struct {
 	// stores no attribute, so no consumer can act on it.
 	PublishIdentity *bool `json:"publishIdentity,omitempty"`
 	// Metrics exports llm_d_epp_agent_identity_requests_total,
+	// llm_d_epp_agent_identity_thread_requests_total,
 	// llm_d_epp_agent_identity_active_sessions and
 	// llm_d_epp_agent_identity_active_sessions_untracked_total. Defaults to
 	// false. Only one
@@ -180,6 +181,7 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 		p.requests = c.requests
 		p.activeGauge = c.active
 		p.untracked = c.untracked
+		p.threadRequests = c.threadRequests
 		p.harnessLabels = newHarnessLabels(maxHarnessLabelValues)
 		p.active = newActiveSessions(maxActiveSessions)
 		if handle != nil {
@@ -224,6 +226,7 @@ type Plugin struct {
 	requests        *prometheus.CounterVec
 	activeGauge     *prometheus.GaugeVec
 	untracked       prometheus.Counter
+	threadRequests  *prometheus.CounterVec
 	harnessLabels   *metrics.BoundedLabel
 	active          *activeSessions
 	activeHarnesses map[string]int // owned by the refresh goroutine
@@ -252,8 +255,9 @@ func (p *Plugin) Produces() map[plugin.DataKey]any {
 
 func (p *Plugin) RequestHeader(_ context.Context, request *scheduling.InferenceRequest) error {
 	sessionHeader, session := p.resolveSession(request.Headers)
+	threadHeader, thread := p.resolveThread(request.Headers)
 	if p.requests != nil {
-		p.observe(request.Headers, sessionHeader, session)
+		p.observe(request.Headers, sessionHeader, session, threadHeader)
 	}
 	if p.silent {
 		return nil
@@ -262,13 +266,6 @@ func (p *Plugin) RequestHeader(_ context.Context, request *scheduling.InferenceR
 		request.PutAttribute(AgentIdentityKey, session)
 	}
 
-	thread, threadHeader := "", ""
-	for _, header := range p.threadHeaders {
-		if id := strings.TrimSpace(request.Headers[header]); id != "" {
-			thread, threadHeader = id, header
-			break
-		}
-	}
 	if thread == "" {
 		// No thread header: the session is the only thread.
 		thread = session
@@ -307,9 +304,21 @@ func (p *Plugin) resolveSession(headers map[string]string) (header, id string) {
 	return "", ""
 }
 
+// resolveThread returns the first thread header with a non-empty trimmed value
+// and that value, or two empty strings when none matches.
+func (p *Plugin) resolveThread(headers map[string]string) (header, id string) {
+	for _, h := range p.threadHeaders {
+		if v := strings.TrimSpace(headers[h]); v != "" {
+			return h, v
+		}
+	}
+	return "", ""
+}
+
 // observe records the request in the metrics.
-func (p *Plugin) observe(headers map[string]string, sessionHeader, session string) {
+func (p *Plugin) observe(headers map[string]string, sessionHeader, session, threadHeader string) {
 	harness := p.harness(headers)
+	p.threadRequests.WithLabelValues(harness, threadHeaderLabel(threadHeader, session)).Inc()
 	if sessionHeader == "" {
 		p.requests.WithLabelValues(harness, sessionHeaderNone).Inc()
 		return
@@ -317,5 +326,19 @@ func (p *Plugin) observe(headers map[string]string, sessionHeader, session strin
 	p.requests.WithLabelValues(harness, sessionHeader).Inc()
 	if !p.active.observe(session, harness, time.Now()) {
 		p.untracked.Inc()
+	}
+}
+
+// threadHeaderLabel is the thread_header label: the matched thread header,
+// threadHeaderSession when the thread falls back to the session identity, or
+// sessionHeaderNone when the request has neither.
+func threadHeaderLabel(threadHeader, session string) string {
+	switch {
+	case threadHeader != "":
+		return threadHeader
+	case session != "":
+		return threadHeaderSession
+	default:
+		return sessionHeaderNone
 	}
 }
